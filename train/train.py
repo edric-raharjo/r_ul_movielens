@@ -1,630 +1,543 @@
 # train/train.py
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import DataLoader, Subset
-import numpy as np
-from pathlib import Path
 import sys
-from typing import Dict, Optional, Tuple
-from tqdm import tqdm
-import json
+from pathlib import Path
+
+# Add project root to Python path
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
+import torch
+import torch.optim as optim
+from torch.utils.data import DataLoader
 import argparse
-from datetime import datetime
+import numpy as np
+import json
+import copy
+from tqdm import tqdm
+import random
 
-# Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
+from dataset.dataloader import create_dataloaders, MovieLensRecommendationDataset
+from model.dqn_model import RecommendationDQN, DQNWithTargetNetwork
+from model.loss_function import (
+    DQNRecommendationLoss, 
+    DecrementalRLLoss,
+    create_random_forget_samples
+)
+from eval.evaluate import RecommendationEvaluator, evaluate_before_after_unlearning
+from eval.eval_metrics import print_metrics
 
-from model.dqn_model import DQN, create_dqn
-from model.loss_function import DoubleDQNLoss, DecrementalRLLoss
-from dataset.dataloader import MovieLensRLDataset, create_dataloaders
-from eval.evaluate import DQNEvaluator, evaluate_unlearning
-from eval.eval_metrics import RLRecommendationMetrics, compare_metrics
+
+def set_seed(seed: int):
+    """Set random seeds for reproducibility"""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
-class DQNTrainer:
+def train_epoch(
+    dqn_manager: DQNWithTargetNetwork,
+    train_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    loss_fn: DQNRecommendationLoss,
+    device: str
+) -> dict:
     """
-    Trainer for DQN-based recommendation system with unlearning support.
+    Train for one epoch.
+    
+    Returns:
+        Dictionary with training metrics
     """
+    dqn_manager.train_mode()
+    online_net = dqn_manager.get_online_network()
     
-    def __init__(
-        self,
-        state_dim: int,
-        action_dim: int,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-        learning_rate: float = 1e-4,
-        gamma: float = 0.99,
-        target_update_freq: int = 1000,
-        architecture: str = 'standard',
-        hidden_dims: list = [512, 256, 128],
-        dropout_rate: float = 0.2
-    ):
-        """
-        Args:
-            state_dim: State dimension
-            action_dim: Action dimension (number of movies)
-            device: Device to train on
-            learning_rate: Learning rate for optimizer
-            gamma: Discount factor
-            target_update_freq: Steps between target network updates
-            architecture: 'standard' or 'dueling'
-            hidden_dims: Hidden layer dimensions
-            dropout_rate: Dropout rate
-        """
-        self.device = device
-        self.gamma = gamma
-        self.target_update_freq = target_update_freq
-        self.step_count = 0
-        
-        # Create networks
-        self.q_network = create_dqn(
-            state_dim, action_dim, architecture,
-            hidden_dims=hidden_dims, dropout_rate=dropout_rate
-        ).to(device)
-        
-        self.target_network = create_dqn(
-            state_dim, action_dim, architecture,
-            hidden_dims=hidden_dims, dropout_rate=dropout_rate
-        ).to(device)
-        
-        # Initialize target network
-        self.target_network.copy_weights_from(self.q_network)
-        self.target_network.eval()
-        
-        # Optimizer and loss
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
-        self.criterion = DoubleDQNLoss(gamma=gamma)
-        
-        print(f"DQN Trainer initialized on {device}")
-        print(f"Q-Network parameters: {sum(p.numel() for p in self.q_network.parameters()):,}")
+    epoch_losses = []
+    epoch_accuracies = []
     
-    def train_epoch(
-        self,
-        dataloader: DataLoader,
-        epoch: int,
-        desc: str = "Training"
-    ) -> Dict[str, float]:
-        """
-        Train for one epoch.
+    pbar = tqdm(train_loader, desc="Training")
+    for batch in pbar:
+        # Move to device
+        inputs = batch['input_features'].to(device)
+        labels = batch['label'].squeeze().to(device)
+        rewards = batch['reward'].squeeze().to(device)
         
-        Returns:
-            Dictionary with training metrics
-        """
-        self.q_network.train()
-        epoch_losses = []
+        # Forward pass
+        q_values = online_net(inputs)
         
-        pbar = tqdm(dataloader, desc=f"{desc} Epoch {epoch+1}")
-        for batch in pbar:
-            # Move batch to device
-            states = batch['state'].to(self.device)
-            actions = batch['action'].to(self.device)
-            rewards = batch['reward'].to(self.device)
-            next_states = batch['next_state'].to(self.device)
-            dones = batch['done'].to(self.device)
-            
-            # Compute loss
-            loss = self.criterion(
-                self.q_network,
-                self.target_network,
-                states, actions, rewards, next_states, dones
-            )
-            
-            # Optimize
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=10.0)
-            self.optimizer.step()
-            
-            epoch_losses.append(loss.item())
-            self.step_count += 1
-            
-            # Update target network
-            if self.step_count % self.target_update_freq == 0:
-                self.target_network.copy_weights_from(self.q_network)
-            
-            # Update progress bar
-            pbar.set_postfix({'loss': f'{loss.item():.4f}'})
+        # Compute loss
+        loss, loss_dict = loss_fn(q_values, rewards, labels)
         
-        return {
-            'loss': np.mean(epoch_losses),
-            'loss_std': np.std(epoch_losses)
-        }
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(online_net.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
+        # Update target network
+        dqn_manager.update_target_network()
+        
+        # Track metrics
+        epoch_losses.append(loss_dict['total_loss'])
+        epoch_accuracies.append(loss_dict['accuracy'])
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'loss': f"{loss_dict['total_loss']:.4f}",
+            'acc': f"{loss_dict['accuracy']:.2%}"
+        })
     
-    def train(
-        self,
-        train_dataloader: DataLoader,
-        num_epochs: int,
-        eval_dataloaders: Optional[Dict[str, DataLoader]] = None,
-        eval_dataset: Optional[MovieLensRLDataset] = None,
-        eval_freq: int = 5,
-        save_dir: str = 'checkpoints'
-    ) -> Dict:
-        """
-        Full training loop.
-        
-        Args:
-            train_dataloader: Training data
-            num_epochs: Number of epochs
-            eval_dataloaders: Dict with 'retain' and 'forget' dataloaders for evaluation
-            eval_dataset: Dataset for evaluation
-            eval_freq: Evaluate every N epochs
-            save_dir: Directory to save checkpoints
-            
-        Returns:
-            Training history
-        """
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        history = {
-            'train_loss': [],
-            'eval_metrics': []
-        }
-        
-        print(f"\n{'='*70}")
-        print("STARTING DQN TRAINING")
-        print(f"{'='*70}")
-        print(f"Epochs: {num_epochs}")
-        print(f"Batches per epoch: {len(train_dataloader)}")
-        print(f"Total steps: {num_epochs * len(train_dataloader)}")
-        print(f"{'='*70}\n")
-        
-        for epoch in range(num_epochs):
-            # Train
-            train_metrics = self.train_epoch(train_dataloader, epoch)
-            history['train_loss'].append(train_metrics['loss'])
-            
-            print(f"Epoch {epoch+1}/{num_epochs} - Loss: {train_metrics['loss']:.4f} ± {train_metrics['loss_std']:.4f}")
-            
-            # Evaluate
-            if eval_dataloaders is not None and (epoch + 1) % eval_freq == 0:
-                print(f"\n--- Evaluation at Epoch {epoch+1} ---")
-                evaluator = DQNEvaluator(self.q_network, self.device)
-                eval_results = evaluator.evaluate_split(eval_dataloaders, eval_dataset)
-                history['eval_metrics'].append({
-                    'epoch': epoch + 1,
-                    'results': {k: v.compute_aggregate_metrics() for k, v in eval_results.items()}
-                })
-            
-            # Save checkpoint
-            if (epoch + 1) % 10 == 0 or (epoch + 1) == num_epochs:
-                checkpoint_path = save_dir / f'dqn_epoch_{epoch+1}.pt'
-                self.save_checkpoint(checkpoint_path)
-        
-        # Final save
-        final_path = save_dir / 'dqn_trained.pt'
-        self.save_checkpoint(final_path)
-        print(f"\nTraining complete! Model saved to {final_path}")
-        
-        return history
-    
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
-        torch.save({
-            'q_network': self.q_network.state_dict(),
-            'target_network': self.target_network.state_dict(),
-            'optimizer': self.optimizer.state_dict(),
-            'step_count': self.step_count
-        }, path)
-    
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint"""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.q_network.load_state_dict(checkpoint['q_network'])
-        self.target_network.load_state_dict(checkpoint['target_network'])
-        self.optimizer.load_state_dict(checkpoint['optimizer'])
-        self.step_count = checkpoint.get('step_count', 0)
-        print(f"Checkpoint loaded from {path}")
+    return {
+        'loss': np.mean(epoch_losses),
+        'loss_std': np.std(epoch_losses),
+        'accuracy': np.mean(epoch_accuracies),
+        'accuracy_std': np.std(epoch_accuracies)
+    }
 
 
-class DecrementalRLTrainer:
+def train_normal_phase(
+    dqn_manager: DQNWithTargetNetwork,
+    train_loader: DataLoader,
+    args,
+    checkpoint_dir: Path
+) -> RecommendationDQN:
     """
-    Trainer for Decremental RL-based unlearning.
-    """
+    Normal training phase (Phase 1).
     
-    def __init__(
-        self,
-        q_network: nn.Module,
-        original_q_network: nn.Module,
-        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-        learning_rate: float = 1e-5,
-        lambda_weight: float = 1.0
-    ):
-        """
-        Args:
-            q_network: Q-network to be updated (will be modified)
-            original_q_network: Original frozen Q-network (Q_RF)
-            device: Device to train on
-            learning_rate: Learning rate (should be smaller than normal training)
-            lambda_weight: Weight for retain set regularization
-        """
-        self.device = device
-        self.q_network = q_network.to(device)
-        self.original_q_network = original_q_network.to(device)
-        
-        # Freeze original network
-        self.original_q_network.eval()
-        for param in self.original_q_network.parameters():
-            param.requires_grad = False
-        
-        # Set q_network to training mode
-        self.q_network.train()
-        
-        # Optimizer and loss
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=learning_rate)
-        self.criterion = DecrementalRLLoss(lambda_weight=lambda_weight)
-        
-        print(f"\nDecremental RL Trainer initialized")
-        print(f"Lambda weight: {lambda_weight}")
-        print(f"Learning rate: {learning_rate}")
-    
-    def collect_random_forget_samples(
-        self,
-        dataset: MovieLensRLDataset,
-        forget_users: set,
-        samples_per_user: int = 50
-    ) -> Dict[str, torch.Tensor]:
-        """
-        Collect random exploration samples from forget users.
-        
-        Args:
-            dataset: MovieLens dataset
-            forget_users: Set of forget user IDs
-            samples_per_user: Number of random samples per user
-            
-        Returns:
-            Dictionary with states and actions
-        """
-        print(f"\nCollecting random samples from {len(forget_users)} forget users...")
-        
-        forget_samples = {'states': [], 'actions': []}
-        
-        for user_id in tqdm(list(forget_users), desc="Random exploration"):
-            # Get user's episodes
-            user_episodes = [ep for ep in dataset.episodes if ep['user_id'] == user_id]
-            
-            if len(user_episodes) == 0:
-                continue
-            
-            # Sample random episodes
-            sampled_episodes = np.random.choice(
-                user_episodes,
-                size=min(samples_per_user, len(user_episodes)),
-                replace=True
-            )
-            
-            for ep in sampled_episodes:
-                # Get state
-                state = dataset._encode_state(ep['state_movies'], ep['state_ratings'])
-                
-                # Random action (uniform)
-                random_action = np.random.randint(0, dataset.num_movies)
-                
-                forget_samples['states'].append(state)
-                forget_samples['actions'].append(random_action)
-        
-        # Convert to tensors
-        forget_samples['states'] = torch.stack(forget_samples['states'])
-        forget_samples['actions'] = torch.tensor(forget_samples['actions'], dtype=torch.long)
-        
-        print(f"Collected {len(forget_samples['states'])} random samples")
-        return forget_samples
-    
-    def unlearn_epoch(
-        self,
-        forget_dataloader: DataLoader,
-        retain_dataloader: DataLoader,
-        epoch: int
-    ) -> Dict[str, float]:
-        """
-        Unlearning for one epoch.
-        
-        Returns:
-            Dictionary with unlearning metrics
-        """
-        self.q_network.train()
-        epoch_metrics = {
-            'total_loss': [],
-            'forget_loss': [],
-            'retain_loss': [],
-            'weighted_retain_loss': []
-        }
-        
-        # Create iterators
-        forget_iter = iter(forget_dataloader)
-        retain_iter = iter(retain_dataloader)
-        
-        num_batches = min(len(forget_dataloader), len(retain_dataloader))
-        
-        pbar = tqdm(range(num_batches), desc=f"Unlearning Epoch {epoch+1}")
-        for _ in pbar:
-            try:
-                forget_batch = next(forget_iter)
-                retain_batch = next(retain_iter)
-            except StopIteration:
-                break
-            
-            # Move to device
-            forget_states = forget_batch['state'].to(self.device)
-            forget_actions = forget_batch['action'].to(self.device)
-            retain_states = retain_batch['state'].to(self.device)
-            retain_actions = retain_batch['action'].to(self.device)
-            
-            # Compute loss
-            loss, loss_dict = self.criterion(
-                self.q_network,
-                self.original_q_network,
-                forget_states, forget_actions,
-                retain_states, retain_actions
-            )
-            
-            # Optimize
-            self.optimizer.zero_grad()
-            loss.backward()
-            torch.nn.utils.clip_grad_norm_(self.q_network.parameters(), max_norm=10.0)
-            self.optimizer.step()
-            
-            # Track metrics
-            for key in epoch_metrics:
-                epoch_metrics[key].append(loss_dict[key])
-            
-            # Update progress bar
-            pbar.set_postfix({
-                'total': f"{loss_dict['total_loss']:.4f}",
-                'forget': f"{loss_dict['forget_loss']:.4f}",
-                'retain': f"{loss_dict['retain_loss']:.4f}"
-            })
-        
-        # Average metrics
-        return {k: np.mean(v) for k, v in epoch_metrics.items()}
-    
-    def unlearn(
-        self,
-        forget_dataloader: DataLoader,
-        retain_dataloader: DataLoader,
-        num_epochs: int,
-        save_dir: str = 'checkpoints'
-    ) -> Dict:
-        """
-        Full unlearning loop.
-        
-        Args:
-            forget_dataloader: Forget set data
-            retain_dataloader: Retain set data
-            num_epochs: Number of unlearning epochs
-            save_dir: Directory to save checkpoints
-            
-        Returns:
-            Unlearning history
-        """
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        history = {
-            'total_loss': [],
-            'forget_loss': [],
-            'retain_loss': []
-        }
-        
-        print(f"\n{'='*70}")
-        print("STARTING DECREMENTAL RL UNLEARNING")
-        print(f"{'='*70}")
-        print(f"Epochs: {num_epochs}")
-        print(f"Forget batches: {len(forget_dataloader)}")
-        print(f"Retain batches: {len(retain_dataloader)}")
-        print(f"{'='*70}\n")
-        
-        for epoch in range(num_epochs):
-            metrics = self.unlearn_epoch(forget_dataloader, retain_dataloader, epoch)
-            
-            history['total_loss'].append(metrics['total_loss'])
-            history['forget_loss'].append(metrics['forget_loss'])
-            history['retain_loss'].append(metrics['retain_loss'])
-            
-            print(f"Epoch {epoch+1}/{num_epochs} - "
-                  f"Total: {metrics['total_loss']:.4f}, "
-                  f"Forget: {metrics['forget_loss']:.4f}, "
-                  f"Retain: {metrics['retain_loss']:.4f}")
-            
-            # Save checkpoint
-            if (epoch + 1) % 5 == 0 or (epoch + 1) == num_epochs:
-                checkpoint_path = save_dir / f'dqn_unlearned_epoch_{epoch+1}.pt'
-                torch.save(self.q_network.state_dict(), checkpoint_path)
-        
-        # Final save
-        final_path = save_dir / 'dqn_unlearned.pt'
-        torch.save(self.q_network.state_dict(), final_path)
-        print(f"\nUnlearning complete! Model saved to {final_path}")
-        
-        return history
-
-
-def print_comparison_table(results_before: Dict, results_after: Dict):
-    """
-    Print comparison table like the paper.
-    
-    Table format:
-    ┌─────────────┬────────────────┬───────────────┬─────────────┐
-    │ Set         │ Metric         │ Before        │ After       │
-    ├─────────────┼────────────────┼───────────────┼─────────────┤
-    │ Forget      │ Accuracy (%)   │ 92.07         │ 68.63       │
-    │             │ Cumul. Reward  │ 41.42         │ 20.03       │
-    │ Retain      │ Accuracy (%)   │ 91.85         │ 91.12       │
-    │             │ Cumul. Reward  │ 40.98         │ 40.23       │
-    └─────────────┴────────────────┴───────────────┴─────────────┘
+    Returns:
+        Trained model
     """
     print("\n" + "="*80)
-    print("UNLEARNING RESULTS COMPARISON (Paper-style Table)")
+    print("PHASE 1: NORMAL DQN TRAINING")
     print("="*80)
     
-    # Header
-    print(f"\n{'Set':<15} {'Metric':<25} {'Before':<15} {'After':<15} {'Change':<15}")
-    print("-"*80)
+    online_net = dqn_manager.get_online_network()
+    optimizer = optim.Adam(online_net.parameters(), lr=args.learning_rate)
+    loss_fn = DQNRecommendationLoss(rating_threshold=4.0)
     
-    for set_name in ['forget', 'retain']:
-        if set_name not in results_before or set_name not in results_after:
-            continue
-        
-        before = results_before[set_name].compute_aggregate_metrics()
-        after = results_after[set_name].compute_aggregate_metrics()
-        
-        # Top-1 Accuracy
-        acc_before = before['mean_top1_accuracy'] * 100
-        acc_after = after['mean_top1_accuracy'] * 100
-        acc_change = acc_after - acc_before
-        
-        print(f"{set_name.upper():<15} {'Top-1 Accuracy (%)':<25} "
-              f"{acc_before:>10.2f}     {acc_after:>10.2f}     {acc_change:>+10.2f}")
-        
-        # Cumulative Reward
-        reward_before = before['mean_cumulative_reward']
-        reward_after = after['mean_cumulative_reward']
-        reward_change = reward_after - reward_before
-        
-        print(f"{'':15} {'Mean Cumul. Reward':<25} "
-              f"{reward_before:>10.2f}     {reward_after:>10.2f}     {reward_change:>+10.2f}")
-        
-        # Average Reward
-        avg_reward_before = before['mean_avg_reward']
-        avg_reward_after = after['mean_avg_reward']
-        avg_reward_change = avg_reward_after - avg_reward_before
-        
-        print(f"{'':15} {'Mean Avg Reward (stars)':<25} "
-              f"{avg_reward_before:>10.3f}     {avg_reward_after:>10.3f}     {avg_reward_change:>+10.3f}")
-        
-        print("-"*80)
+    best_loss = float('inf')
     
+    for epoch in range(1, args.num_epochs + 1):
+        print(f"\n{'='*80}")
+        print(f"Epoch {epoch}/{args.num_epochs}")
+        print(f"{'='*80}")
+        
+        # Train
+        train_metrics = train_epoch(
+            dqn_manager, train_loader, optimizer, loss_fn, args.device
+        )
+        
+        print(f"\nEpoch {epoch} Results:")
+        print(f"  Loss: {train_metrics['loss']:.4f} ± {train_metrics['loss_std']:.4f}")
+        print(f"  Accuracy: {train_metrics['accuracy']:.2%} ± {train_metrics['accuracy_std']:.2%}")
+        
+        # Save checkpoint
+        if epoch % args.eval_freq == 0:
+            checkpoint_path = checkpoint_dir / f'dqn_epoch_{epoch}.pt'
+            torch.save(online_net.state_dict(), checkpoint_path)
+            print(f"  Checkpoint saved: {checkpoint_path}")
+        
+        # Save best model
+        if train_metrics['loss'] < best_loss:
+            best_loss = train_metrics['loss']
+            best_path = checkpoint_dir / 'dqn_best.pt'
+            torch.save(online_net.state_dict(), best_path)
+            print(f"  Best model saved: {best_path}")
+    
+    # Save final trained model
+    trained_path = checkpoint_dir / 'dqn_trained.pt'
+    torch.save(online_net.state_dict(), trained_path)
+    print(f"\nTraining complete! Model saved to {trained_path}")
+    
+    return online_net
+
+
+def unlearning_epoch(
+    model: RecommendationDQN,
+    original_model: RecommendationDQN,
+    random_forget_samples: dict,
+    retain_loader: DataLoader,
+    optimizer: optim.Optimizer,
+    loss_fn: DecrementalRLLoss,
+    device: str
+) -> dict:
+    """
+    One epoch of decremental RL unlearning.
+    
+    Returns:
+        Dictionary with unlearning metrics
+    """
+    model.train()
+    
+    epoch_losses = []
+    epoch_forget_losses = []
+    epoch_retain_losses = []
+    
+    # Create iterator for retain set
+    retain_iterator = iter(retain_loader)
+    
+    # Number of batches = number of forget samples / batch_size
+    num_forget_samples = len(random_forget_samples['inputs'])
+    batch_size = 32  # Use smaller batch for unlearning
+    num_batches = max(1, num_forget_samples // batch_size)
+    
+    pbar = tqdm(range(num_batches), desc="Unlearning")
+    for batch_idx in pbar:
+        # Get forget batch
+        start_idx = batch_idx * batch_size
+        end_idx = min((batch_idx + 1) * batch_size, num_forget_samples)
+        
+        forget_inputs = random_forget_samples['inputs'][start_idx:end_idx]
+        forget_actions = random_forget_samples['actions'][start_idx:end_idx]
+        
+        # Get retain batch
+        try:
+            retain_batch = next(retain_iterator)
+        except StopIteration:
+            retain_iterator = iter(retain_loader)
+            retain_batch = next(retain_iterator)
+        
+        retain_inputs = retain_batch['input_features'].to(device)
+        
+        # Forward pass on forget set
+        q_forget = model(forget_inputs)
+        
+        # Forward pass on retain set (both models)
+        q_retain_new = model(retain_inputs)
+        with torch.no_grad():
+            q_retain_original = original_model(retain_inputs)
+        
+        # Compute unlearning loss
+        loss, loss_dict = loss_fn(
+            q_forget, forget_actions,
+            q_retain_new, q_retain_original
+        )
+        
+        # Backward pass
+        optimizer.zero_grad()
+        loss.backward()
+        
+        # Gradient clipping
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        
+        optimizer.step()
+        
+        # Track metrics
+        epoch_losses.append(loss_dict['total_loss'])
+        epoch_forget_losses.append(loss_dict['forget_loss'])
+        epoch_retain_losses.append(loss_dict['retain_loss'])
+        
+        # Update progress bar
+        pbar.set_postfix({
+            'total': f"{loss_dict['total_loss']:.4f}",
+            'forget': f"{loss_dict['forget_loss']:.4f}",
+            'retain': f"{loss_dict['retain_loss']:.4f}"
+        })
+    
+    return {
+        'total_loss': np.mean(epoch_losses),
+        'forget_loss': np.mean(epoch_forget_losses),
+        'retain_loss': np.mean(epoch_retain_losses),
+        'total_loss_std': np.std(epoch_losses)
+    }
+
+
+def unlearning_phase(
+    trained_model: RecommendationDQN,
+    forget_dataset: MovieLensRecommendationDataset,
+    retain_loader: DataLoader,
+    forget_users: set,
+    args,
+    checkpoint_dir: Path
+) -> RecommendationDQN:
+    """
+    Decremental RL unlearning phase (Phase 2).
+    
+    Returns:
+        Unlearned model
+    """
+    print("\n" + "="*80)
+    print("PHASE 2: DECREMENTAL RL UNLEARNING")
     print("="*80)
+    
+    # Create random forget samples
+    print("\nGenerating random samples for forget set...")
+    random_samples = create_random_forget_samples(
+        forget_dataset,
+        forget_users,
+        num_samples_per_user=50,
+        device=args.device
+    )
+    
+    if len(random_samples['inputs']) == 0:
+        print("ERROR: No forget samples generated!")
+        return trained_model
+    
+    # Create copy of model for unlearning
+    unlearning_model = copy.deepcopy(trained_model)
+    original_model = copy.deepcopy(trained_model)
+    original_model.eval()
+    for param in original_model.parameters():
+        param.requires_grad = False
+    
+    # Optimizer and loss
+    optimizer = optim.Adam(unlearning_model.parameters(), lr=args.unlearning_lr)
+    loss_fn = DecrementalRLLoss(lambda_weight=args.lambda_weight)
+    
+    print(f"\nUnlearning Configuration:")
+    print(f"  Epochs: {args.unlearning_epochs}")
+    print(f"  Learning rate: {args.unlearning_lr}")
+    print(f"  Lambda weight: {args.lambda_weight}")
+    print(f"  Forget samples: {len(random_samples['inputs'])}")
+    
+    # Unlearning loop
+    for epoch in range(1, args.unlearning_epochs + 1):
+        print(f"\n{'='*80}")
+        print(f"Unlearning Epoch {epoch}/{args.unlearning_epochs}")
+        print(f"{'='*80}")
+        
+        # Unlearn
+        unlearn_metrics = unlearning_epoch(
+            unlearning_model, original_model,
+            random_samples, retain_loader,
+            optimizer, loss_fn, args.device
+        )
+        
+        print(f"\nEpoch {epoch} Results:")
+        print(f"  Total Loss: {unlearn_metrics['total_loss']:.4f}")
+        print(f"  Forget Loss: {unlearn_metrics['forget_loss']:.4f}")
+        print(f"  Retain Loss: {unlearn_metrics['retain_loss']:.4f}")
+        
+        # Save checkpoint
+        if epoch % 5 == 0:
+            checkpoint_path = checkpoint_dir / f'dqn_unlearned_epoch_{epoch}.pt'
+            torch.save(unlearning_model.state_dict(), checkpoint_path)
+            print(f"  Checkpoint saved: {checkpoint_path}")
+    
+    # Save final unlearned model
+    unlearned_path = checkpoint_dir / 'dqn_unlearned.pt'
+    torch.save(unlearning_model.state_dict(), unlearned_path)
+    print(f"\nUnlearning complete! Model saved to {unlearned_path}")
+    
+    return unlearning_model
 
 
 def main(args):
     """Main training pipeline"""
     
-    # Set random seeds
-    torch.manual_seed(args.seed)
-    np.random.seed(args.seed)
+    print("\n" + "="*80)
+    print("DQN RECOMMENDATION SYSTEM WITH DECREMENTAL RL UNLEARNING")
+    print("="*80)
     
-    print(f"\n{'='*80}")
-    print("DQN RECOMMENDATION SYSTEM - TRAINING WITH UNLEARNING")
-    print(f"{'='*80}")
-    print(f"Dataset: {args.data_dir}")
-    print(f"Forget ratio: {args.forget_ratio}")
-    print(f"Use genome: {args.use_genome}")
-    print(f"Pilot mode: {args.pilot_users if args.pilot_users else 'Disabled'}")
-    print(f"Device: {args.device}")
-    print(f"{'='*80}\n")
+    # Set seed
+    set_seed(args.seed)
+    print(f"\nRandom seed set to {args.seed}")
+    
+    # Create checkpoint directory
+    checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Save arguments
+    with open(checkpoint_dir / 'config.json', 'w') as f:
+        json.dump(vars(args), f, indent=2)
+    print(f"Configuration saved to {checkpoint_dir / 'config.json'}")
     
     # Load data
-    print("Loading MovieLens data...")
-    dataloaders, dataset = create_dataloaders(
+    print("\n" + "="*80)
+    print("LOADING DATA")
+    print("="*80)
+    
+    dataloaders, train_dataset = create_dataloaders(
         data_dir=args.data_dir,
         forget_ratio=args.forget_ratio,
-        use_genome=args.use_genome,
-        state_size=args.state_size,
+        rating_threshold=4.0,
         batch_size=args.batch_size,
-        user_total=args.pilot_users,  
+        user_total=args.pilot_users,
         seed=args.seed
     )
     
-    # Get dimensions
-    state_dim = dataset.get_state_dim()
-    action_dim = dataset.get_action_dim()
+    train_loader = dataloaders['train']
+    retain_test_loader = dataloaders['retain_test']
+    forget_test_loader = dataloaders['forget_test']
     
-    print(f"\nModel dimensions:")
-    print(f"  State dim: {state_dim}")
-    print(f"  Action dim: {action_dim}")
+    # Get retain and forget users
+    retain_users = train_dataset.retain_users
+    forget_users = train_dataset.forget_users
     
-    # ==================== PHASE 1: NORMAL TRAINING ====================
+    print(f"\nData loaded successfully!")
+    print(f"  Train samples: {len(train_dataset):,}")
+    print(f"  Retain users: {len(retain_users)}")
+    print(f"  Forget users: {len(forget_users)}")
+    
+    # Create test datasets for evaluation
+    retain_test_dataset = MovieLensRecommendationDataset(
+        data_dir=args.data_dir,
+        forget_ratio=args.forget_ratio,
+        rating_threshold=4.0,
+        user_total=args.pilot_users,
+        mode='retain',
+        split='test',
+        seed=args.seed
+    )
+    
+    forget_test_dataset = MovieLensRecommendationDataset(
+        data_dir=args.data_dir,
+        forget_ratio=args.forget_ratio,
+        rating_threshold=4.0,
+        user_total=args.pilot_users,
+        mode='forget',
+        split='test',
+        seed=args.seed
+    )
+    
+    # Phase 1: Normal Training
     if not args.skip_training:
+        # Create DQN manager
         print("\n" + "="*80)
-        print("PHASE 1: NORMAL DQN TRAINING")
+        print("INITIALIZING MODEL")
         print("="*80)
         
-        trainer = DQNTrainer(
-            state_dim=state_dim,
-            action_dim=action_dim,
+        # Note: Input dim is 44 (22 user + 22 candidate) as per our design
+        dqn_manager = DQNWithTargetNetwork(
+            input_dim=42,  # Fixed based on our architecture
+            hidden_dims=[128, 128],  # From paper
+            dropout_rate=0.2,
             device=args.device,
-            learning_rate=args.learning_rate,
-            gamma=args.gamma,
             target_update_freq=args.target_update_freq,
-            hidden_dims=args.hidden_dims
+            use_soft_update=False
         )
         
-        training_history = trainer.train(
-            train_dataloader=dataloaders['train'],
-            num_epochs=args.num_epochs,
-            eval_dataloaders={'retain': dataloaders['retain'], 'forget': dataloaders['forget']},
-            eval_dataset=dataset,
-            eval_freq=args.eval_freq,
-            save_dir=args.checkpoint_dir
+        trained_model = train_normal_phase(
+            dqn_manager, train_loader, args, checkpoint_dir
         )
-        
-        # Evaluate before unlearning
-        print("\n" + "="*80)
-        print("EVALUATION BEFORE UNLEARNING")
-        print("="*80)
-        evaluator = DQNEvaluator(trainer.q_network, args.device)
-        results_before = evaluator.evaluate_split(dataloaders, dataset, splits=['retain', 'forget'])
-        
-        # Save original model
-        model_before = trainer.q_network
     else:
         # Load pretrained model
-        print(f"\nLoading pretrained model from {args.pretrained_path}")
-        model_before = create_dqn(state_dim, action_dim, hidden_dims=args.hidden_dims).to(args.device)
-        model_before.load_state_dict(torch.load(args.pretrained_path))
+        print("\n" + "="*80)
+        print("LOADING PRETRAINED MODEL")
+        print("="*80)
         
-        evaluator = DQNEvaluator(model_before, args.device)
-        results_before = evaluator.evaluate_split(dataloaders, dataset, splits=['retain', 'forget'])
+        if args.pretrained_path is None:
+            args.pretrained_path = str(checkpoint_dir / 'dqn_trained.pt')
+        
+        trained_model = RecommendationDQN(input_dim=44, hidden_dims=[128, 128])
+        trained_model.load_state_dict(torch.load(args.pretrained_path, map_location=args.device))
+        trained_model.to(args.device)
+        print(f"Model loaded from {args.pretrained_path}")
     
-    # ==================== PHASE 2: UNLEARNING ====================
+    # Evaluate before unlearning
+    print("\n" + "="*80)
+    print("EVALUATION BEFORE UNLEARNING")
+    print("="*80)
+    
+    evaluator_before = RecommendationEvaluator(trained_model, args.device)
+    
+    print("\nEvaluating RETAIN set...")
+    retain_metrics_before = evaluator_before.evaluate_full(
+        retain_test_dataset, 
+        batch_size=128,
+        include_ranking=True
+    )
+    print_metrics(retain_metrics_before, "RETAIN - Before Unlearning")
+    
+    print("\nEvaluating FORGET set...")
+    forget_metrics_before = evaluator_before.evaluate_full(
+        forget_test_dataset,
+        batch_size=128,
+        include_ranking=True
+    )
+    print_metrics(forget_metrics_before, "FORGET - Before Unlearning")
+    
+    # Phase 2: Unlearning
     if not args.skip_unlearning:
-        print("\n" + "="*80)
-        print("PHASE 2: DECREMENTAL RL UNLEARNING")
-        print("="*80)
-        
-        # Create copy for unlearning
-        model_after = create_dqn(state_dim, action_dim, hidden_dims=args.hidden_dims).to(args.device)
-        model_after.load_state_dict(model_before.state_dict())
-        
-        # Unlearning trainer
-        unlearning_trainer = DecrementalRLTrainer(
-            q_network=model_after,
-            original_q_network=model_before,
-            device=args.device,
-            learning_rate=args.unlearning_lr,
-            lambda_weight=args.lambda_weight
+        unlearned_model = unlearning_phase(
+            trained_model,
+            forget_test_dataset,
+            retain_test_loader,
+            forget_users,
+            args,
+            checkpoint_dir
         )
+    else:
+        print("\nSkipping unlearning phase (--skip_unlearning flag set)")
+        unlearned_model = trained_model
+    
+    # Evaluate after unlearning
+    print("\n" + "="*80)
+    print("EVALUATION AFTER UNLEARNING")
+    print("="*80)
+    
+    evaluator_after = RecommendationEvaluator(unlearned_model, args.device)
+    
+    print("\nEvaluating RETAIN set...")
+    retain_metrics_after = evaluator_after.evaluate_full(
+        retain_test_dataset,
+        batch_size=128,
+        include_ranking=True
+    )
+    print_metrics(retain_metrics_after, "RETAIN - After Unlearning")
+    
+    print("\nEvaluating FORGET set...")
+    forget_metrics_after = evaluator_after.evaluate_full(
+        forget_test_dataset,
+        batch_size=128,
+        include_ranking=True
+    )
+    print_metrics(forget_metrics_after, "FORGET - After Unlearning")
+    
+    # Final comparison
+    from eval.eval_metrics import compare_metrics, print_comparison
+    
+    print("\n" + "="*80)
+    print("FINAL COMPARISON")
+    print("="*80)
+    
+    retain_comparison = compare_metrics(retain_metrics_before, retain_metrics_after)
+    print_comparison(retain_comparison, "RETAIN SET: Before vs After")
+    
+    forget_comparison = compare_metrics(forget_metrics_before, forget_metrics_after)
+    print_comparison(forget_comparison, "FORGET SET: Before vs After")
+    
+    # Save results
+    results = {
+        'retain': {
+            'before': retain_metrics_before,
+            'after': retain_metrics_after,
+            'comparison': retain_comparison
+        },
+        'forget': {
+            'before': forget_metrics_before,
+            'after': forget_metrics_after,
+            'comparison': forget_comparison
+        }
+    }
+    
+    results_path = checkpoint_dir / 'unlearning_results.json'
+    with open(results_path, 'w') as f:
+        # Convert numpy types to native Python
+        def convert(obj):
+            if isinstance(obj, dict):
+                return {k: convert(v) for k, v in obj.items()}
+            elif isinstance(obj, (np.integer, np.floating)):
+                return float(obj)
+            elif isinstance(obj, np.ndarray):
+                return obj.tolist()
+            else:
+                return obj
         
-        # Unlearning
-        unlearning_history = unlearning_trainer.unlearn(
-            forget_dataloader=dataloaders['forget'],
-            retain_dataloader=dataloaders['retain'],
-            num_epochs=args.unlearning_epochs,
-            save_dir=args.checkpoint_dir
-        )
-        
-        # Evaluate after unlearning
-        print("\n" + "="*80)
-        print("EVALUATION AFTER UNLEARNING")
-        print("="*80)
-        evaluator_after = DQNEvaluator(model_after, args.device)
-        results_after = evaluator_after.evaluate_split(dataloaders, dataset, splits=['retain', 'forget'])
-        
-        # Print comparison table
-        print_comparison_table(results_before, results_after)
-        
-        # Save results
-        results_path = Path(args.checkpoint_dir) / 'unlearning_results.json'
-        with open(results_path, 'w') as f:
-            json.dump({
-                'before': {k: v.compute_aggregate_metrics() for k, v in results_before.items()},
-                'after': {k: v.compute_aggregate_metrics() for k, v in results_after.items()},
-                'training_history': training_history if not args.skip_training else None,
-                'unlearning_history': unlearning_history
-            }, f, indent=2)
-        print(f"\nResults saved to {results_path}")
+        json.dump(convert(results), f, indent=2)
+    
+    print(f"\nResults saved to {results_path}")
+    
+    print("\n" + "="*80)
+    print("PIPELINE COMPLETE!")
+    print("="*80)
 
 
 if __name__ == "__main__":
@@ -636,18 +549,14 @@ if __name__ == "__main__":
                        help='Path to MovieLens data directory')
     parser.add_argument('--forget_ratio', type=float, default=0.1,
                        help='Ratio of users to forget')
-    parser.add_argument('--use_genome', action='store_true',
-                       help='Use genome features')
-    parser.add_argument('--state_size', type=int, default=50,
-                       help='State size (number of movies in history)')
     parser.add_argument('--pilot_users', type=int, default=None,
                        help='Number of users for pilot testing (None = all users)')
     
-    # Model arguments
-    parser.add_argument('--hidden_dims', type=int, nargs='+', default=[512, 256, 128],
+    # Model arguments (kept for compatibility but not used since we have fixed architecture)
+    parser.add_argument('--hidden_dims', type=int, nargs='+', default=[128, 128],
                        help='Hidden layer dimensions')
     parser.add_argument('--gamma', type=float, default=0.99,
-                       help='Discount factor')
+                       help='Discount factor (not used in current implementation)')
     
     # Training arguments
     parser.add_argument('--num_epochs', type=int, default=20,

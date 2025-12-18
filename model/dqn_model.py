@@ -3,53 +3,50 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from typing import Optional
+from typing import Optional, Tuple
 
 
-class DQN(nn.Module):
+class RecommendationDQN(nn.Module):
     """
-    Deep Q-Network for movie recommendation.
+    Deep Q-Network for binary movie recommendation.
     
     Architecture:
-        Input (state_dim) → 512 → 256 → 128 → Output (action_dim)
-        With ReLU activations and optional dropout.
+        Input(44) → Hidden(128) → Hidden(128) → Output(2)
+        [Q(don't recommend), Q(recommend)]
     """
     
     def __init__(
         self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dims: list = [512, 256, 128],
+        input_dim: int = 44,
+        hidden_dims: list = [128, 128],
         dropout_rate: float = 0.2,
-        use_dropout: bool = True
+        output_dim: int = 2
     ):
         """
         Args:
-            state_dim: Dimension of state vector (e.g., 100 without genome, 56500 with genome)
-            action_dim: Number of possible actions (number of movies)
+            input_dim: Input feature dimension (22 user + 22 candidate = 44)
             hidden_dims: List of hidden layer dimensions
             dropout_rate: Dropout probability
-            use_dropout: Whether to use dropout layers
+            output_dim: Number of actions (2: don't rec, rec)
         """
-        super(DQN, self).__init__()
+        super(RecommendationDQN, self).__init__()
         
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.use_dropout = use_dropout
+        self.input_dim = input_dim
+        self.hidden_dims = hidden_dims
+        self.output_dim = output_dim
         
         # Build network layers
         layers = []
-        input_dim = state_dim
+        current_dim = input_dim
         
         for hidden_dim in hidden_dims:
-            layers.append(nn.Linear(input_dim, hidden_dim))
+            layers.append(nn.Linear(current_dim, hidden_dim))
             layers.append(nn.ReLU())
-            if use_dropout:
-                layers.append(nn.Dropout(dropout_rate))
-            input_dim = hidden_dim
+            layers.append(nn.Dropout(dropout_rate))
+            current_dim = hidden_dim
         
         # Output layer (no activation - raw Q-values)
-        layers.append(nn.Linear(input_dim, action_dim))
+        layers.append(nn.Linear(current_dim, output_dim))
         
         self.network = nn.Sequential(*layers)
         
@@ -64,106 +61,119 @@ class DQN(nn.Module):
                 if module.bias is not None:
                     nn.init.constant_(module.bias, 0.0)
     
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
         Forward pass through the network.
         
         Args:
-            state: State tensor of shape (batch_size, state_dim)
+            x: Input tensor of shape (batch_size, input_dim)
+               Should be [user_state(22), candidate_features(22)]
             
         Returns:
-            Q-values tensor of shape (batch_size, action_dim)
+            Q-values tensor of shape (batch_size, 2)
+            [Q(don't recommend), Q(recommend)]
         """
-        return self.network(state)
+        return self.network(x)
     
-    def get_q_value(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+    def get_q_values(
+        self, 
+        user_state: torch.Tensor, 
+        candidate_features: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Get Q-value for specific state-action pairs.
+        Get Q-values for user-candidate pairs.
         
         Args:
-            state: State tensor of shape (batch_size, state_dim)
-            action: Action tensor of shape (batch_size,) containing action indices
+            user_state: (batch_size, 22)
+            candidate_features: (batch_size, 22)
             
         Returns:
-            Q-values tensor of shape (batch_size, 1)
+            Q-values: (batch_size, 2)
         """
-        q_values = self.forward(state)
-        return q_values.gather(1, action.unsqueeze(1))
-    
-    def get_max_q_value(self, state: torch.Tensor) -> tuple:
-        """
-        Get maximum Q-value and corresponding action for each state.
-        
-        Args:
-            state: State tensor of shape (batch_size, state_dim)
-            
-        Returns:
-            tuple: (max_q_values, best_actions)
-                - max_q_values: shape (batch_size, 1)
-                - best_actions: shape (batch_size, 1)
-        """
-        q_values = self.forward(state)
-        max_q_values, best_actions = q_values.max(dim=1, keepdim=True)
-        return max_q_values, best_actions
+        x = torch.cat([user_state, candidate_features], dim=1)
+        return self.forward(x)
     
     def select_action(
-        self,
-        state: torch.Tensor,
-        epsilon: float = 0.0,
-        valid_actions: Optional[torch.Tensor] = None
-    ) -> torch.Tensor:
+        self, 
+        user_state: torch.Tensor, 
+        candidate_features: torch.Tensor,
+        epsilon: float = 0.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
         Select action using epsilon-greedy policy.
         
         Args:
-            state: State tensor of shape (batch_size, state_dim)
-            epsilon: Exploration probability (0.0 = pure exploitation)
-            valid_actions: Boolean mask of shape (batch_size, action_dim) 
-                          indicating valid actions (True = valid)
+            user_state: (batch_size, 22)
+            candidate_features: (batch_size, 22)
+            epsilon: Exploration probability
             
         Returns:
-            Selected actions of shape (batch_size,)
+            actions: (batch_size,) - Selected actions (0 or 1)
+            q_values: (batch_size, 2) - Q-values for logging
         """
-        batch_size = state.shape[0]
+        batch_size = user_state.shape[0]
+        
+        # Get Q-values
+        q_values = self.get_q_values(user_state, candidate_features)
         
         # Epsilon-greedy selection
         if torch.rand(1).item() < epsilon:
             # Random action
-            if valid_actions is not None:
-                # Sample from valid actions only
-                actions = []
-                for i in range(batch_size):
-                    valid_idx = torch.where(valid_actions[i])[0]
-                    random_action = valid_idx[torch.randint(len(valid_idx), (1,))]
-                    actions.append(random_action)
-                return torch.stack(actions).squeeze()
-            else:
-                # Sample from all actions
-                return torch.randint(0, self.action_dim, (batch_size,))
+            actions = torch.randint(0, 2, (batch_size,), device=user_state.device)
         else:
             # Greedy action (max Q-value)
-            q_values = self.forward(state)
-            
-            if valid_actions is not None:
-                # Mask invalid actions with -inf
-                masked_q = q_values.clone()
-                masked_q[~valid_actions] = float('-inf')
-                return masked_q.argmax(dim=1)
-            else:
-                return q_values.argmax(dim=1)
+            actions = q_values.argmax(dim=1)
+        
+        return actions, q_values
     
-    def copy_weights_from(self, source_network: 'DQN'):
+    def predict_recommend(
+        self,
+        user_state: torch.Tensor,
+        candidate_features: torch.Tensor
+    ) -> torch.Tensor:
         """
-        Copy weights from another DQN network (for target network updates).
+        Predict whether to recommend (binary classification).
+        
+        Args:
+            user_state: (batch_size, 22)
+            candidate_features: (batch_size, 22)
+            
+        Returns:
+            predictions: (batch_size,) - 0 or 1
+        """
+        q_values = self.get_q_values(user_state, candidate_features)
+        return q_values.argmax(dim=1)
+    
+    def get_q_recommend(
+        self,
+        user_state: torch.Tensor,
+        candidate_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Get Q-value for "recommend" action only (for ranking).
+        
+        Args:
+            user_state: (batch_size, 22)
+            candidate_features: (batch_size, 22)
+            
+        Returns:
+            Q(recommend): (batch_size,)
+        """
+        q_values = self.get_q_values(user_state, candidate_features)
+        return q_values[:, 1]  # Return Q(recommend) only
+    
+    def copy_weights_from(self, source_network: 'RecommendationDQN'):
+        """
+        Copy weights from another network (for target network hard update).
         
         Args:
             source_network: Source DQN to copy weights from
         """
         self.load_state_dict(source_network.state_dict())
     
-    def soft_update(self, source_network: 'DQN', tau: float = 0.005):
+    def soft_update(self, source_network: 'RecommendationDQN', tau: float = 0.005):
         """
-        Soft update of target network parameters using Polyak averaging.
+        Soft update of network parameters using Polyak averaging.
         θ_target = τ * θ_source + (1 - τ) * θ_target
         
         Args:
@@ -176,124 +186,179 @@ class DQN(nn.Module):
             )
 
 
-class DuelingDQN(nn.Module):
+class DQNWithTargetNetwork:
     """
-    Dueling DQN architecture (optional enhancement).
-    Separates value and advantage streams.
+    Wrapper class that manages both online and target networks.
     """
     
     def __init__(
         self,
-        state_dim: int,
-        action_dim: int,
-        hidden_dims: list = [512, 256],
-        dropout_rate: float = 0.2
+        input_dim: int = 44,
+        hidden_dims: list = [128, 128],
+        dropout_rate: float = 0.2,
+        device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+        target_update_freq: int = 1000,
+        use_soft_update: bool = False,
+        tau: float = 0.005
     ):
-        super(DuelingDQN, self).__init__()
-        
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        
-        # Shared feature layers
-        self.feature_layers = nn.Sequential(
-            nn.Linear(state_dim, hidden_dims[0]),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dims[0], hidden_dims[1]),
-            nn.ReLU(),
-            nn.Dropout(dropout_rate)
-        )
-        
-        # Value stream: V(s)
-        self.value_stream = nn.Sequential(
-            nn.Linear(hidden_dims[1], 128),
-            nn.ReLU(),
-            nn.Linear(128, 1)
-        )
-        
-        # Advantage stream: A(s, a)
-        self.advantage_stream = nn.Sequential(
-            nn.Linear(hidden_dims[1], 128),
-            nn.ReLU(),
-            nn.Linear(128, action_dim)
-        )
-        
-        self._initialize_weights()
-    
-    def _initialize_weights(self):
-        for module in self.modules():
-            if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
-                if module.bias is not None:
-                    nn.init.constant_(module.bias, 0.0)
-    
-    def forward(self, state: torch.Tensor) -> torch.Tensor:
         """
-        Forward pass using dueling architecture.
-        Q(s,a) = V(s) + (A(s,a) - mean(A(s,·)))
+        Args:
+            input_dim: Input dimension
+            hidden_dims: Hidden layer dimensions
+            dropout_rate: Dropout rate
+            device: Device to use
+            target_update_freq: Steps between target network updates (hard update)
+            use_soft_update: Use soft update instead of hard update
+            tau: Soft update interpolation parameter
         """
-        features = self.feature_layers(state)
+        self.device = device
+        self.target_update_freq = target_update_freq
+        self.use_soft_update = use_soft_update
+        self.tau = tau
+        self.step_count = 0
         
-        value = self.value_stream(features)  # (batch, 1)
-        advantage = self.advantage_stream(features)  # (batch, action_dim)
+        # Create online and target networks
+        self.online_network = RecommendationDQN(
+            input_dim, hidden_dims, dropout_rate
+        ).to(device)
         
-        # Combine using mean subtraction
-        q_values = value + (advantage - advantage.mean(dim=1, keepdim=True))
+        self.target_network = RecommendationDQN(
+            input_dim, hidden_dims, dropout_rate
+        ).to(device)
         
-        return q_values
-
-
-# Utility function
-def create_dqn(
-    state_dim: int,
-    action_dim: int,
-    architecture: str = 'standard',
-    **kwargs
-) -> nn.Module:
-    """
-    Factory function to create DQN models.
+        # Initialize target network
+        self.target_network.copy_weights_from(self.online_network)
+        self.target_network.eval()
+        
+        print(f"DQN with Target Network initialized on {device}")
+        print(f"Parameters: {sum(p.numel() for p in self.online_network.parameters()):,}")
     
-    Args:
-        state_dim: State dimension
-        action_dim: Action dimension
-        architecture: 'standard' or 'dueling'
-        **kwargs: Additional arguments for the model
-        
-    Returns:
-        DQN model
-    """
-    if architecture == 'standard':
-        return DQN(state_dim, action_dim, **kwargs)
-    elif architecture == 'dueling':
-        return DuelingDQN(state_dim, action_dim, **kwargs)
-    else:
-        raise ValueError(f"Unknown architecture: {architecture}")
+    def update_target_network(self):
+        """Update target network based on configuration"""
+        if self.use_soft_update:
+            # Soft update every step
+            self.target_network.soft_update(self.online_network, self.tau)
+        else:
+            # Hard update at specified frequency
+            self.step_count += 1
+            if self.step_count % self.target_update_freq == 0:
+                self.target_network.copy_weights_from(self.online_network)
+                print(f"Target network updated at step {self.step_count}")
+    
+    def get_online_network(self) -> RecommendationDQN:
+        """Get online network for training"""
+        return self.online_network
+    
+    def get_target_network(self) -> RecommendationDQN:
+        """Get target network for computing targets"""
+        return self.target_network
+    
+    def train_mode(self):
+        """Set online network to training mode"""
+        self.online_network.train()
+    
+    def eval_mode(self):
+        """Set online network to evaluation mode"""
+        self.online_network.eval()
+    
+    def save(self, path: str):
+        """Save both networks"""
+        torch.save({
+            'online_network': self.online_network.state_dict(),
+            'target_network': self.target_network.state_dict(),
+            'step_count': self.step_count
+        }, path)
+        print(f"Models saved to {path}")
+    
+    def load(self, path: str):
+        """Load both networks"""
+        checkpoint = torch.load(path, map_location=self.device)
+        self.online_network.load_state_dict(checkpoint['online_network'])
+        self.target_network.load_state_dict(checkpoint['target_network'])
+        self.step_count = checkpoint.get('step_count', 0)
+        print(f"Models loaded from {path}")
 
 
+# Test code
 if __name__ == "__main__":
-    # Test the model
-    print("Testing DQN model...")
+    print("Testing RecommendationDQN...")
     
-    state_dim = 100  # Without genome
-    action_dim = 9742  # Example number of movies
-    batch_size = 32
-    
-    # Create model
-    model = DQN(state_dim, action_dim)
-    print(f"Model created: {sum(p.numel() for p in model.parameters())} parameters")
+    # Test basic model
+    model = RecommendationDQN(input_dim=44, hidden_dims=[128, 128])
+    print(f"\nModel architecture:")
+    print(model)
+    print(f"\nTotal parameters: {sum(p.numel() for p in model.parameters()):,}")
     
     # Test forward pass
-    dummy_state = torch.randn(batch_size, state_dim)
-    q_values = model(dummy_state)
-    print(f"Q-values shape: {q_values.shape}")  # Should be (32, 9742)
+    batch_size = 32
+    user_state = torch.randn(batch_size, 22)
+    candidate = torch.randn(batch_size, 22)
+    input_vec = torch.cat([user_state, candidate], dim=1)
+    
+    q_values = model(input_vec)
+    print(f"\nInput shape: {input_vec.shape}")
+    print(f"Output shape: {q_values.shape}")
+    print(f"Sample Q-values: {q_values[0]}")
+    
+    # Test get_q_values
+    q_vals = model.get_q_values(user_state, candidate)
+    print(f"\nget_q_values output: {q_vals.shape}")
     
     # Test action selection
-    actions = model.select_action(dummy_state, epsilon=0.1)
-    print(f"Selected actions shape: {actions.shape}")  # Should be (32,)
+    actions, q_vals = model.select_action(user_state, candidate, epsilon=0.1)
+    print(f"\nSelected actions shape: {actions.shape}")
+    print(f"First 5 actions: {actions[:5]}")
     
-    # Test with valid action mask
-    valid_mask = torch.rand(batch_size, action_dim) > 0.9  # 10% valid actions
-    masked_actions = model.select_action(dummy_state, epsilon=0.0, valid_actions=valid_mask)
-    print(f"Masked actions shape: {masked_actions.shape}")
+    # Test predict_recommend
+    predictions = model.predict_recommend(user_state, candidate)
+    print(f"\nPredictions shape: {predictions.shape}")
+    print(f"Prediction distribution: {predictions.float().mean().item():.2%} recommend")
     
-    print("\nAll tests passed!")
+    # Test get_q_recommend
+    q_rec = model.get_q_recommend(user_state, candidate)
+    print(f"\nQ(recommend) shape: {q_rec.shape}")
+    print(f"Q(recommend) range: [{q_rec.min():.3f}, {q_rec.max():.3f}]")
+    
+    # Test DQN with target network
+    print("\n" + "="*70)
+    print("Testing DQNWithTargetNetwork...")
+    print("="*70)
+    
+    dqn_manager = DQNWithTargetNetwork(
+        input_dim=44,
+        hidden_dims=[128, 128],
+        device='cpu',
+        target_update_freq=1000
+    )
+    
+    online = dqn_manager.get_online_network()
+    target = dqn_manager.get_target_network()
+    
+    # Check they're initially the same
+    online_output = online(input_vec)
+    target_output = target(input_vec)
+    diff = (online_output - target_output).abs().max()
+    print(f"\nInitial difference between networks: {diff.item():.6f}")
+    
+    # Simulate training step
+    dqn_manager.train_mode()
+    online.zero_grad()
+    loss = online_output.mean()
+    loss.backward()
+    
+    # Update target
+    dqn_manager.update_target_network()
+    
+    # Test save/load
+    import tempfile
+    with tempfile.NamedTemporaryFile(suffix='.pt', delete=False) as f:
+        temp_path = f.name
+    
+    dqn_manager.save(temp_path)
+    dqn_manager.load(temp_path)
+    print(f"\nSave/Load test passed!")
+    
+    import os
+    os.unlink(temp_path)
+    
+    print("\n✅ All tests passed!")

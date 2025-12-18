@@ -1,260 +1,367 @@
 # eval/evaluate.py
 
 import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
 import numpy as np
 from pathlib import Path
-import sys
-from typing import Dict, List, Optional
+from typing import Dict, List, Tuple, Optional
 from tqdm import tqdm
+import json
 
-# Add parent directory to path
-sys.path.append(str(Path(__file__).parent.parent))
+from model.dqn_model import RecommendationDQN, DQNWithTargetNetwork
+from dataset.dataloader import MovieLensRecommendationDataset
+from eval.eval_metrics import (
+    RecommendationMetrics, 
+    print_metrics, 
+    print_comparison,
+    compare_metrics
+)
 
-from eval.eval_metrics import RLRecommendationMetrics, compare_metrics, save_metrics
-from model.dqn_model import DQN  # You'll implement this
-from dataset.dataloader import MovieLensRLDataset, create_dataloaders
 
-
-class DQNEvaluator:
+class RecommendationEvaluator:
     """
-    Evaluator for DQN-based recommendation system.
-    Handles evaluation on retain/forget sets with comprehensive metrics.
+    Evaluator for recommendation DQN model.
     """
     
     def __init__(
         self,
-        model: nn.Module,
+        model: RecommendationDQN,
         device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
         k_values: List[int] = [1, 5, 10]
     ):
         """
         Args:
             model: Trained DQN model
-            device: Device to run evaluation on
-            k_values: K values for Top-K accuracy
+            device: Device to use
+            k_values: K values for ranking metrics
         """
-        self.model = model.to(device)
+        self.model = model
         self.device = device
+        self.metrics_calculator = RecommendationMetrics(k_values=k_values)
         self.k_values = k_values
+        
+        self.model.to(device)
         self.model.eval()
     
     @torch.no_grad()
-    def evaluate_dataset(
+    def evaluate_classification(
         self,
-        dataloader: DataLoader,
-        dataset: MovieLensRLDataset,
-        desc: str = "Evaluating"
-    ) -> RLRecommendationMetrics:
-        """Evaluate DQN on a dataset with action masking"""
-        metrics = RLRecommendationMetrics(k_values=self.k_values)
+        dataset: MovieLensRecommendationDataset,
+        batch_size: int = 128
+    ) -> Dict[str, float]:
+        """
+        Evaluate binary classification performance.
         
-        for batch in tqdm(dataloader, desc=desc):
-            states = batch['state'].to(self.device)
-            actions = batch['action'].to(self.device)
-            rewards = batch['reward'].to(self.device)
-            user_ids = batch['user_id']
+        Args:
+            dataset: Test dataset
+            batch_size: Batch size for evaluation
             
-            # Get Q-values
-            q_values = self.model(states)  # (batch_size, num_movies)
+        Returns:
+            Dictionary with classification metrics
+        """
+        self.model.eval()
+        
+        all_predictions = []
+        all_labels = []
+        all_rewards = []
+        
+        # Process in batches
+        num_samples = len(dataset)
+        num_batches = (num_samples + batch_size - 1) // batch_size
+        
+        for i in tqdm(range(num_batches), desc="Evaluating classification"):
+            start_idx = i * batch_size
+            end_idx = min((i + 1) * batch_size, num_samples)
             
-            # Apply action masks for each user
-            for i in range(len(user_ids)):
-                user_id = user_ids[i].item() if torch.is_tensor(user_ids[i]) else user_ids[i]
-                
-                # Get user's action mask
-                action_mask = dataset.get_user_action_mask(user_id).to(self.device)
-                
-                # Mask invalid actions
-                masked_q = q_values[i].clone()
-                masked_q[~action_mask] = float('-inf')
-                
-                # Get top-1 prediction
-                predicted_action = masked_q.argmax().item()
-                
-                # Get top-K predictions
-                topk_dict = {}
-                for k in self.k_values:
-                    # Only consider valid actions for top-k
-                    valid_k = min(k, action_mask.sum().item())
-                    _, topk_indices = torch.topk(masked_q, k=valid_k)
-                    topk_dict[k] = topk_indices.cpu().numpy().tolist()
-                
-                # Update metrics
-                metrics.update(
-                    user_id=user_id,
-                    predicted_action=predicted_action,
-                    actual_action=actions[i].item(),
-                    reward=rewards[i].item(),
-                    top_k_actions=topk_dict
-                )
+            # Get batch
+            batch_inputs = []
+            batch_labels = []
+            batch_rewards = []
+            
+            for j in range(start_idx, end_idx):
+                sample = dataset[j]
+                batch_inputs.append(sample['input_features'])
+                batch_labels.append(sample['label'])
+                batch_rewards.append(sample['reward'])
+            
+            # Stack and move to device
+            inputs = torch.stack(batch_inputs).to(self.device)
+            labels = torch.stack(batch_labels).squeeze().to(self.device)
+            rewards = torch.stack(batch_rewards).squeeze().to(self.device)
+            
+            # Forward pass
+            q_values = self.model(inputs)
+            predictions = q_values.argmax(dim=1)
+            
+            all_predictions.append(predictions.cpu())
+            all_labels.append(labels.cpu())
+            all_rewards.append(rewards.cpu())
+        
+        # Concatenate all batches
+        all_predictions = torch.cat(all_predictions)
+        all_labels = torch.cat(all_labels)
+        all_rewards = torch.cat(all_rewards)
+        
+        # Compute metrics
+        metrics = self.metrics_calculator.compute_all_metrics(
+            all_predictions, all_labels
+        )
+        
+        # Add average reward
+        metrics['avg_reward'] = all_rewards.mean().item()
         
         return metrics
     
-    def evaluate_split(
+    @torch.no_grad()
+    def evaluate_ranking(
         self,
-        dataloaders: Dict[str, DataLoader],
-        dataset: MovieLensRLDataset,
-        splits: List[str] = ['retain', 'forget']
-    ) -> Dict[str, RLRecommendationMetrics]:
+        dataset: MovieLensRecommendationDataset,
+        num_candidates: int = 100,
+        rating_threshold: float = 4.0
+    ) -> Dict[str, float]:
         """
-        Evaluate on multiple splits (retain/forget).
+        Evaluate ranking performance (top-K recommendation).
         
         Args:
-            dataloaders: Dict mapping split name -> DataLoader
-            dataset: Dataset object
-            splits: List of split names to evaluate
+            dataset: Test dataset
+            num_candidates: Number of candidate items to rank per user
+            rating_threshold: Threshold for positive items
             
         Returns:
-            Dict mapping split name -> RLRecommendationMetrics
+            Dictionary with ranking metrics
         """
-        results = {}
+        self.model.eval()
         
-        for split in splits:
-            if split not in dataloaders:
-                print(f"Warning: Split '{split}' not found in dataloaders")
+        # Group samples by user
+        user_samples = {}
+        for sample in dataset.samples:
+            user_id = sample['user_id']
+            if user_id not in user_samples:
+                user_samples[user_id] = []
+            user_samples[user_id].append(sample)
+        
+        print(f"Evaluating {len(user_samples)} users for ranking...")
+        
+        user_rankings = {}
+        
+        for user_id, samples in tqdm(user_samples.items(), desc="Ranking evaluation"):
+            # Get ground truth positive items
+            ground_truth = [
+                s['movie_id'] for s in samples 
+                if s['reward'] >= rating_threshold
+            ]
+            
+            if len(ground_truth) == 0:
                 continue
             
-            print(f"\nEvaluating {split.upper()} set...")
-            metrics = self.evaluate_dataset(
-                dataloaders[split],
-                dataset,
-                desc=f"Evaluating {split}"
-            )
-            results[split] = metrics
-            metrics.print_summary(title=f"{split.upper()} Set Results")
+            # Limit candidates if needed
+            if len(samples) > num_candidates:
+                samples = np.random.choice(samples, num_candidates, replace=False)
+            
+            # Score all candidates
+            scores = []
+            movie_ids = []
+            
+            for sample in samples:
+                input_vec = torch.cat([
+                    torch.FloatTensor(sample['user_state']),
+                    torch.FloatTensor(sample['candidate_features'])
+                ]).unsqueeze(0).to(self.device)
+                
+                q_values = self.model(input_vec)
+                q_recommend = q_values[0, 1].item()  # Q(recommend)
+                
+                scores.append(q_recommend)
+                movie_ids.append(sample['movie_id'])
+            
+            # Rank by Q(recommend)
+            ranked_indices = np.argsort(scores)[::-1]  # Descending
+            ranked_items = [movie_ids[i] for i in ranked_indices]
+            
+            user_rankings[user_id] = (ranked_items, ground_truth)
         
-        return results
-
-
-def evaluate_unlearning(
-    model_before: nn.Module,
-    model_after: nn.Module,
-    dataloaders: Dict[str, DataLoader],
-    dataset: MovieLensRLDataset,
-    device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
-    save_dir: Optional[str] = None
-) -> Dict:
-    """
-    Comprehensive unlearning evaluation comparing before/after models.
-    
-    Args:
-        model_before: DQN model before unlearning
-        model_after: DQN model after unlearning
-        dataloaders: Dict with 'retain' and 'forget' dataloaders
-        dataset: Dataset object
-        device: Device for evaluation
-        save_dir: Directory to save results (optional)
-        
-    Returns:
-        Dict containing all evaluation results
-    """
-    print("\n" + "=" * 70)
-    print("UNLEARNING EVALUATION")
-    print("=" * 70)
-    
-    # Evaluate BEFORE unlearning
-    print("\n>>> BEFORE UNLEARNING <<<")
-    evaluator_before = DQNEvaluator(model_before, device)
-    results_before = evaluator_before.evaluate_split(dataloaders, dataset)
-    
-    # Evaluate AFTER unlearning
-    print("\n>>> AFTER UNLEARNING <<<")
-    evaluator_after = DQNEvaluator(model_after, device)
-    results_after = evaluator_after.evaluate_split(dataloaders, dataset)
-    
-    # Compare results
-    print("\n" + "=" * 70)
-    print("COMPARISON ANALYSIS")
-    print("=" * 70)
-    
-    for split in ['forget', 'retain']:
-        if split in results_before and split in results_after:
-            before_metrics = results_before[split].compute_aggregate_metrics()
-            after_metrics = results_after[split].compute_aggregate_metrics()
-            compare_metrics(
-                before_metrics,
-                after_metrics,
-                title=f"{split.upper()} Set: Before vs After Unlearning"
-            )
-    
-    # Save results if directory provided
-    if save_dir is not None:
-        save_dir = Path(save_dir)
-        save_dir.mkdir(parents=True, exist_ok=True)
-        
-        for split in ['forget', 'retain']:
-            if split in results_before:
-                metrics_before = results_before[split].compute_aggregate_metrics()
-                user_metrics_before = results_before[split].get_user_metrics_list()
-                save_metrics(
-                    metrics_before,
-                    user_metrics_before,
-                    str(save_dir / f'{split}_before.json')
+        # Compute ranking metrics
+        ranking_metrics = {}
+        for k in self.k_values:
+            hit_scores = []
+            precision_scores = []
+            recall_scores = []
+            
+            for user_id, (ranked_items, ground_truth) in user_rankings.items():
+                hit_scores.append(
+                    self.metrics_calculator.compute_hit_at_k(ranked_items, ground_truth, k)
+                )
+                precision_scores.append(
+                    self.metrics_calculator.compute_precision_at_k(ranked_items, ground_truth, k)
+                )
+                recall_scores.append(
+                    self.metrics_calculator.compute_recall_at_k(ranked_items, ground_truth, k)
                 )
             
-            if split in results_after:
-                metrics_after = results_after[split].compute_aggregate_metrics()
-                user_metrics_after = results_after[split].get_user_metrics_list()
-                save_metrics(
-                    metrics_after,
-                    user_metrics_after,
-                    str(save_dir / f'{split}_after.json')
-                )
+            ranking_metrics[f'hit@{k}'] = np.mean(hit_scores)
+            ranking_metrics[f'precision@{k}'] = np.mean(precision_scores)
+            ranking_metrics[f'recall@{k}'] = np.mean(recall_scores)
+        
+        return ranking_metrics
     
-    return {
-        'before': results_before,
-        'after': results_after
+    def evaluate_full(
+        self,
+        dataset: MovieLensRecommendationDataset,
+        batch_size: int = 128,
+        include_ranking: bool = True,
+        num_candidates: int = 100
+    ) -> Dict[str, float]:
+        """
+        Full evaluation: classification + ranking.
+        
+        Args:
+            dataset: Test dataset
+            batch_size: Batch size
+            include_ranking: Whether to compute ranking metrics
+            num_candidates: Number of candidates for ranking
+            
+        Returns:
+            Complete metrics dictionary
+        """
+        metrics = {}
+        
+        # Classification metrics
+        print("Computing classification metrics...")
+        classification_metrics = self.evaluate_classification(dataset, batch_size)
+        metrics.update(classification_metrics)
+        
+        # Ranking metrics
+        if include_ranking:
+            print("Computing ranking metrics...")
+            ranking_metrics = self.evaluate_ranking(dataset, num_candidates)
+            metrics.update(ranking_metrics)
+        
+        return metrics
+
+
+def evaluate_before_after_unlearning(
+    model_before_path: str,
+    model_after_path: str,
+    retain_dataset: MovieLensRecommendationDataset,
+    forget_dataset: MovieLensRecommendationDataset,
+    device: str = 'cuda',
+    save_path: Optional[str] = None
+) -> Dict[str, Dict[str, float]]:
+    """
+    Evaluate and compare models before and after unlearning.
+    
+    Args:
+        model_before_path: Path to model before unlearning
+        model_after_path: Path to model after unlearning
+        retain_dataset: Retain set dataset
+        forget_dataset: Forget set dataset
+        device: Device to use
+        save_path: Optional path to save results
+        
+    Returns:
+        Dictionary with all results
+    """
+    print("\n" + "="*80)
+    print("EVALUATION: BEFORE vs AFTER UNLEARNING")
+    print("="*80)
+    
+    # Load models
+    print("\nLoading models...")
+    model_before = RecommendationDQN()
+    model_before.load_state_dict(torch.load(model_before_path, map_location=device))
+    
+    model_after = RecommendationDQN()
+    model_after.load_state_dict(torch.load(model_after_path, map_location=device))
+    
+    # Create evaluators
+    evaluator_before = RecommendationEvaluator(model_before, device)
+    evaluator_after = RecommendationEvaluator(model_after, device)
+    
+    results = {}
+    
+    # Evaluate RETAIN set
+    print("\n" + "="*80)
+    print("RETAIN SET EVALUATION")
+    print("="*80)
+    
+    print("\nBefore unlearning:")
+    retain_before = evaluator_before.evaluate_full(retain_dataset)
+    print_metrics(retain_before, "RETAIN - Before Unlearning")
+    
+    print("\nAfter unlearning:")
+    retain_after = evaluator_after.evaluate_full(retain_dataset)
+    print_metrics(retain_after, "RETAIN - After Unlearning")
+    
+    # Compare
+    retain_comparison = compare_metrics(retain_before, retain_after)
+    print_comparison(retain_comparison, "RETAIN SET: Before vs After")
+    
+    results['retain'] = {
+        'before': retain_before,
+        'after': retain_after,
+        'comparison': retain_comparison
     }
+    
+    # Evaluate FORGET set
+    print("\n" + "="*80)
+    print("FORGET SET EVALUATION")
+    print("="*80)
+    
+    print("\nBefore unlearning:")
+    forget_before = evaluator_before.evaluate_full(forget_dataset)
+    print_metrics(forget_before, "FORGET - Before Unlearning")
+    
+    print("\nAfter unlearning:")
+    forget_after = evaluator_after.evaluate_full(forget_dataset)
+    print_metrics(forget_after, "FORGET - After Unlearning")
+    
+    # Compare
+    forget_comparison = compare_metrics(forget_before, forget_after)
+    print_comparison(forget_comparison, "FORGET SET: Before vs After")
+    
+    results['forget'] = {
+        'before': forget_before,
+        'after': forget_after,
+        'comparison': forget_comparison
+    }
+    
+    # Summary
+    print("\n" + "="*80)
+    print("UNLEARNING SUMMARY")
+    print("="*80)
+    print(f"{'Metric':<25} {'Retain Change':>15} {'Forget Change':>15}")
+    print("-"*80)
+    
+    key_metrics = ['accuracy', 'precision', 'recall', 'hit@5', 'hit@10']
+    for metric in key_metrics:
+        if metric in retain_comparison and metric in forget_comparison:
+            retain_change = retain_comparison[metric]['change_pct']
+            forget_change = forget_comparison[metric]['change_pct']
+            print(f"{metric:<25} {retain_change:+14.1f}% {forget_change:+14.1f}%")
+    
+    print("="*80)
+    
+    # Save results
+    if save_path:
+        with open(save_path, 'w') as f:
+            # Convert numpy types to native Python types for JSON serialization
+            def convert_to_native(obj):
+                if isinstance(obj, dict):
+                    return {k: convert_to_native(v) for k, v in obj.items()}
+                elif isinstance(obj, (np.integer, np.floating)):
+                    return float(obj)
+                elif isinstance(obj, np.ndarray):
+                    return obj.tolist()
+                else:
+                    return obj
+            
+            json.dump(convert_to_native(results), f, indent=2)
+        print(f"\nResults saved to {save_path}")
+    
+    return results
 
 
-# Example usage
+# Test code
 if __name__ == "__main__":
-    # Configuration
-    DATA_DIR = "E:\\Kuliah\\Kuliah\\Kuliah\\PRODI\\Semester 7\\ProSkripCode\\data_movie"
-    MODEL_PATH_BEFORE = "checkpoints/dqn_before_unlearning.pt"
-    MODEL_PATH_AFTER = "checkpoints/dqn_after_unlearning.pt"
-    
-    device = 'cuda' if torch.cuda.is_available() else 'cpu'
-    print(f"Using device: {device}")
-    
-    # Load data
-    print("\nLoading data...")
-    dataloaders, dataset = create_dataloaders(
-        data_dir=DATA_DIR,
-        forget_ratio=0.1,
-        use_genome=False,  # Set to True if using genome features
-        state_size=50,
-        batch_size=64
-    )
-    
-    # Get dimensions for model
-    state_dim = dataset.get_state_dim()
-    action_dim = dataset.get_action_dim()
-    print(f"State dim: {state_dim}, Action dim: {action_dim}")
-    
-    # Load models (you'll implement DQN model)
-    # from model.dqn_model import DQN
-    # model_before = DQN(state_dim, action_dim)
-    # model_before.load_state_dict(torch.load(MODEL_PATH_BEFORE))
-    # 
-    # model_after = DQN(state_dim, action_dim)
-    # model_after.load_state_dict(torch.load(MODEL_PATH_AFTER))
-    
-    # For now, using dummy models for testing
-    print("\n[NOTE: Replace with actual trained models]")
-    
-    # Evaluate single model
-    # evaluator = DQNEvaluator(model_before, device)
-    # results = evaluator.evaluate_split(dataloaders, dataset)
-    
-    # Full unlearning evaluation
-    # results = evaluate_unlearning(
-    #     model_before,
-    #     model_after,
-    #     dataloaders,
-    #     dataset,
-    #     device=device,
-    #     save_dir='results/unlearning_eval'
-    # )
+    print("Testing Evaluator...")
+    print("Note: This requires a trained model and dataset to run properly.")
+    print("Run train.py first to generate models and datasets.")

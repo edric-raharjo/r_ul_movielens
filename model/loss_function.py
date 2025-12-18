@@ -6,182 +6,241 @@ import torch.nn.functional as F
 from typing import Dict, Tuple, Optional
 
 
-class DQNLoss(nn.Module):
+class DQNRecommendationLoss(nn.Module):
     """
-    Standard DQN loss using TD learning with target network.
+    DQN loss for binary movie recommendation with scaled inverse rewards.
     
-    Loss = E[(r + γ * max_a' Q_target(s', a') - Q(s, a))²]
+    Q-value targets:
+        Positive (rating >= 4.0): Q_target = [0.0, rating]
+        Negative (rating < 4.0):  Q_target = [2*(5.0-rating), rating]
     """
     
-    def __init__(self, gamma: float = 0.99):
+    def __init__(
+        self,
+        rating_threshold: float = 4.0,
+        max_rating: float = 5.0,
+        negative_boost: float = 2.0
+    ):
         """
         Args:
-            gamma: Discount factor for future rewards
+            rating_threshold: Ratings >= this are positive samples
+            max_rating: Maximum possible rating
+            negative_boost: Multiplier for negative sample inverse reward
         """
-        super(DQNLoss, self).__init__()
-        self.gamma = gamma
+        super(DQNRecommendationLoss, self).__init__()
+        self.rating_threshold = rating_threshold
+        self.max_rating = max_rating
+        self.negative_boost = negative_boost
     
-    def forward(
+    def compute_q_targets(
         self,
-        q_network: nn.Module,
-        target_network: nn.Module,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
-        next_states: torch.Tensor,
-        dones: torch.Tensor
+        ratings: torch.Tensor,
+        labels: torch.Tensor
     ) -> torch.Tensor:
         """
-        Compute DQN loss for a batch of transitions.
+        Compute Q-value targets based on ratings and labels.
         
         Args:
-            q_network: Online Q-network
-            target_network: Target Q-network (frozen)
-            states: Current states, shape (batch_size, state_dim)
-            actions: Actions taken, shape (batch_size,) or (batch_size, 1)
-            rewards: Rewards received, shape (batch_size,) or (batch_size, 1)
-            next_states: Next states, shape (batch_size, state_dim)
-            dones: Terminal flags, shape (batch_size,) or (batch_size, 1)
+            ratings: (batch_size,) actual ratings [0.5-5.0]
+            labels: (batch_size,) binary labels [0 or 1]
             
         Returns:
-            Loss scalar
+            q_targets: (batch_size, 2) targets for [Q(don't), Q(rec)]
         """
-        # Ensure correct shapes
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(1)
-        if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(1)
-        if dones.dim() == 1:
-            dones = dones.unsqueeze(1)
+        batch_size = ratings.shape[0]
+        q_targets = torch.zeros(batch_size, 2, device=ratings.device)
         
-        # Current Q-values: Q(s, a)
-        current_q_values = q_network(states).gather(1, actions)
+        # Positive samples (should recommend)
+        positive_mask = labels == 1
+        q_targets[positive_mask, 0] = 0.0  # Q(don't rec) = 0
+        q_targets[positive_mask, 1] = ratings[positive_mask]  # Q(rec) = rating
         
-        # Target Q-values: r + γ * max_a' Q_target(s', a')
-        with torch.no_grad():
-            next_q_values = target_network(next_states).max(dim=1, keepdim=True)[0]
-            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+        # Negative samples (should NOT recommend)
+        negative_mask = labels == 0
+        q_targets[negative_mask, 0] = self.negative_boost * (
+            self.max_rating - ratings[negative_mask]
+        )  # Q(don't rec) = 2*(5-rating)
+        q_targets[negative_mask, 1] = ratings[negative_mask]  # Q(rec) = rating
         
-        # MSE loss
-        loss = F.mse_loss(current_q_values, target_q_values)
-        
-        return loss
-
-
-class DoubleDQNLoss(nn.Module):
-    """
-    Double DQN loss to reduce overestimation bias.
-    
-    Uses online network for action selection and target network for evaluation.
-    Loss = E[(r + γ * Q_target(s', argmax_a' Q_online(s', a')) - Q(s, a))²]
-    """
-    
-    def __init__(self, gamma: float = 0.99):
-        super(DoubleDQNLoss, self).__init__()
-        self.gamma = gamma
+        return q_targets
     
     def forward(
         self,
-        q_network: nn.Module,
-        target_network: nn.Module,
-        states: torch.Tensor,
-        actions: torch.Tensor,
-        rewards: torch.Tensor,
-        next_states: torch.Tensor,
-        dones: torch.Tensor
-    ) -> torch.Tensor:
-        """Compute Double DQN loss"""
-        # Ensure correct shapes
-        if actions.dim() == 1:
-            actions = actions.unsqueeze(1)
-        if rewards.dim() == 1:
-            rewards = rewards.unsqueeze(1)
-        if dones.dim() == 1:
-            dones = dones.unsqueeze(1)
+        q_values: torch.Tensor,
+        ratings: torch.Tensor,
+        labels: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Compute DQN loss.
         
-        # Current Q-values
-        current_q_values = q_network(states).gather(1, actions)
-        
-        # Double DQN: select action with online network, evaluate with target
-        with torch.no_grad():
-            # Select best action using online network
-            next_actions = q_network(next_states).argmax(dim=1, keepdim=True)
-            # Evaluate that action using target network
-            next_q_values = target_network(next_states).gather(1, next_actions)
-            target_q_values = rewards + (1 - dones) * self.gamma * next_q_values
+        Args:
+            q_values: (batch_size, 2) predicted Q-values
+            ratings: (batch_size,) actual ratings
+            labels: (batch_size,) binary labels (0 or 1)
+            
+        Returns:
+            loss: Scalar loss value
+            loss_dict: Dictionary with loss components
+        """
+        # Compute targets
+        q_targets = self.compute_q_targets(ratings, labels)
         
         # MSE loss
-        loss = F.mse_loss(current_q_values, target_q_values)
+        loss = F.mse_loss(q_values, q_targets)
         
-        return loss
+        # Separate losses for logging
+        with torch.no_grad():
+            # Create masks again for logging (FIX: define them here)
+            positive_mask = labels == 1
+            negative_mask = labels == 0
+            
+            # Loss for each action
+            loss_q0 = F.mse_loss(q_values[:, 0], q_targets[:, 0])
+            loss_q1 = F.mse_loss(q_values[:, 1], q_targets[:, 1])
+            
+            # Loss for positive vs negative samples
+            if positive_mask.any():
+                loss_positive = F.mse_loss(
+                    q_values[positive_mask], 
+                    q_targets[positive_mask]
+                )
+            else:
+                loss_positive = torch.tensor(0.0)
+            
+            if negative_mask.any():
+                loss_negative = F.mse_loss(
+                    q_values[negative_mask],
+                    q_targets[negative_mask]
+                )
+            else:
+                loss_negative = torch.tensor(0.0)
+            
+            # Accuracy (for monitoring)
+            predictions = q_values.argmax(dim=1)
+            accuracy = (predictions == labels).float().mean()
+        
+        loss_dict = {
+            'total_loss': loss.item(),
+            'loss_q_dont': loss_q0.item(),
+            'loss_q_rec': loss_q1.item(),
+            'loss_positive': loss_positive.item(),
+            'loss_negative': loss_negative.item(),
+            'accuracy': accuracy.item()
+        }
+        
+        return loss, loss_dict
 
 
 class DecrementalRLLoss(nn.Module):
     """
-    Decremental RL-based unlearning loss from the paper.
+    Decremental RL loss for unlearning.
     
-    L_u = E_(s,a)~τ_u [Q_π'(s,a)] + λ * E_(s,a)~τ_r |Q_π'(s,a) - Q_π(s,a)|
+    L_u = E[(s,a)~τ_u] [Q_π'(s,a)] + λ * E[(s,a)~τ_r] |Q_π'(s,a) - Q_π(s,a)|
     
-    Term 1: Minimize Q-values on forget set (make agent "forget")
-    Term 2: Keep Q-values close to original on retain set (preserve performance)
+    Term 1: Minimize Q-values on forget set (random policy)
+    Term 2: Preserve Q-values on retain set
     """
     
     def __init__(self, lambda_weight: float = 1.0):
         """
         Args:
-            lambda_weight: Weight for retain set regularization term
+            lambda_weight: Weight for retain set preservation term
         """
         super(DecrementalRLLoss, self).__init__()
         self.lambda_weight = lambda_weight
     
     def forward(
         self,
-        q_network: nn.Module,
-        original_q_network: nn.Module,
-        forget_states: torch.Tensor,
+        q_new_forget: torch.Tensor,
         forget_actions: torch.Tensor,
-        retain_states: torch.Tensor,
-        retain_actions: torch.Tensor
+        q_new_retain: torch.Tensor,
+        q_original_retain: torch.Tensor
     ) -> Tuple[torch.Tensor, Dict[str, float]]:
         """
         Compute decremental RL unlearning loss.
         
         Args:
-            q_network: Current Q-network being updated (Q_π')
-            original_q_network: Original frozen Q-network (Q_π)
-            forget_states: States from forget users, shape (batch_forget, state_dim)
-            forget_actions: Actions from forget users, shape (batch_forget,)
-            retain_states: States from retain users, shape (batch_retain, state_dim)
-            retain_actions: Actions from retain users, shape (batch_retain,)
+            q_new_forget: (batch_forget, 2) Q-values from new network on forget set
+            forget_actions: (batch_forget,) random actions (0 or 1) for forget samples
+            q_new_retain: (batch_retain, 2) Q-values from new network on retain set
+            q_original_retain: (batch_retain, 2) Q-values from original network on retain set
             
         Returns:
-            tuple: (total_loss, loss_dict)
-                - total_loss: Combined loss scalar
-                - loss_dict: Dictionary with individual loss components
+            total_loss: Combined loss
+            loss_dict: Dictionary with loss components
         """
-        # Ensure correct shapes
-        if forget_actions.dim() == 1:
-            forget_actions = forget_actions.unsqueeze(1)
-        if retain_actions.dim() == 1:
-            retain_actions = retain_actions.unsqueeze(1)
+        # Term 1: Minimize Q-values for random actions on forget set
+        # Gather Q-values for the randomly selected actions
+        forget_q_values = q_new_forget.gather(
+            1, forget_actions.unsqueeze(1)
+        ).squeeze(1)
+        forget_loss = forget_q_values.mean()
         
-        # Term 1: Minimize Q-values on forget set
-        # E_(s,a)~τ_u [Q_π'(s,a)]
-        q_forget = q_network(forget_states).gather(1, forget_actions)
-        forget_loss = q_forget.mean()
-        
-        # Term 2: Absolute difference on retain set
-        # E_(s,a)~τ_r |Q_π'(s,a) - Q_π(s,a)|
-        with torch.no_grad():
-            q_retain_original = original_q_network(retain_states).gather(1, retain_actions)
-        
-        q_retain_new = q_network(retain_states).gather(1, retain_actions)
-        retain_loss = torch.abs(q_retain_new - q_retain_original).mean()
+        # Term 2: Absolute difference on retain set (both Q-values)
+        retain_loss = torch.abs(q_new_retain - q_original_retain).mean()
         
         # Combined loss
         total_loss = forget_loss + self.lambda_weight * retain_loss
         
-        # Return loss components for logging
+        # Additional metrics
+        with torch.no_grad():
+            # Average Q-values
+            avg_q_forget = q_new_forget.mean().item()
+            avg_q_retain_new = q_new_retain.mean().item()
+            avg_q_retain_original = q_original_retain.mean().item()
+            
+            # Q-value drift on retain set
+            q_drift = (q_new_retain - q_original_retain).abs().mean().item()
+        
+        loss_dict = {
+            'total_loss': total_loss.item(),
+            'forget_loss': forget_loss.item(),
+            'retain_loss': retain_loss.item(),
+            'weighted_retain_loss': (self.lambda_weight * retain_loss).item(),
+            'avg_q_forget': avg_q_forget,
+            'avg_q_retain_new': avg_q_retain_new,
+            'avg_q_retain_original': avg_q_retain_original,
+            'q_drift': q_drift
+        }
+        
+        return total_loss, loss_dict
+
+
+class DecrementalRLLossSimplified(nn.Module):
+    """
+    Simplified decremental RL loss (alternative).
+    
+    Term 1: Minimize Q(recommend) only on forget set
+    Term 2: Preserve both Q-values on retain set
+    """
+    
+    def __init__(self, lambda_weight: float = 1.0):
+        super(DecrementalRLLossSimplified, self).__init__()
+        self.lambda_weight = lambda_weight
+    
+    def forward(
+        self,
+        q_new_forget: torch.Tensor,
+        q_new_retain: torch.Tensor,
+        q_original_retain: torch.Tensor
+    ) -> Tuple[torch.Tensor, Dict[str, float]]:
+        """
+        Simplified version: minimize Q(recommend) on forget set.
+        
+        Args:
+            q_new_forget: (batch_forget, 2) Q-values on forget set
+            q_new_retain: (batch_retain, 2) Q-values on retain set (new)
+            q_original_retain: (batch_retain, 2) Q-values on retain set (original)
+        """
+        # Term 1: Minimize Q(recommend) on forget set
+        forget_loss = q_new_forget[:, 1].mean()  # Only Q(rec)
+        
+        # Term 2: Preserve Q-values on retain set
+        retain_loss = torch.abs(q_new_retain - q_original_retain).mean()
+        
+        # Combined
+        total_loss = forget_loss + self.lambda_weight * retain_loss
+        
         loss_dict = {
             'total_loss': total_loss.item(),
             'forget_loss': forget_loss.item(),
@@ -192,129 +251,189 @@ class DecrementalRLLoss(nn.Module):
         return total_loss, loss_dict
 
 
-class PoisoningBasedLoss(nn.Module):
+def create_random_forget_samples(
+    forget_dataset,
+    forget_users: set,
+    num_samples_per_user: int = 50,
+    device: str = 'cpu'
+) -> Dict[str, torch.Tensor]:
     """
-    Poisoning-based unlearning loss (alternative method from the paper).
+    Create random action samples for forget users (for unlearning).
     
-    This is mentioned in the paper but not the primary focus.
-    Includes policy divergence term.
+    Args:
+        forget_dataset: Dataset containing forget user samples
+        forget_users: Set of forget user IDs
+        num_samples_per_user: Number of random samples per user
+        device: Device to put tensors on
+        
+    Returns:
+        Dictionary with:
+        - 'inputs': (N, 44) concatenated user+candidate features
+        - 'actions': (N,) random actions (0 or 1)
+        - 'user_ids': (N,) user IDs
+        - 'movie_ids': (N,) movie IDs
     """
+    import numpy as np
     
-    def __init__(
-        self,
-        lambda1: float = 1.0,
-        lambda2: float = 1.0
-    ):
-        """
-        Args:
-            lambda1: Weight for policy divergence term
-            lambda2: Weight for performance preservation term
-        """
-        super(PoisoningBasedLoss, self).__init__()
-        self.lambda1 = lambda1
-        self.lambda2 = lambda2
+    random_samples = {
+        'inputs': [],
+        'actions': [],
+        'user_ids': [],
+        'movie_ids': []
+    }
     
-    def forward(
-        self,
-        q_network: nn.Module,
-        original_q_network: nn.Module,
-        forget_states: torch.Tensor,
-        retain_states: torch.Tensor,
-        retain_actions: torch.Tensor,
-        retain_rewards: torch.Tensor
-    ) -> Tuple[torch.Tensor, Dict[str, float]]:
-        """
-        Compute poisoning-based unlearning loss.
-        
-        R_i = λ1 * Δ(π_i(s_i) || π_{i+1}(s_i)) + λ2 * Σ π_i(s,a)r(s,a)
-        """
-        # Policy divergence on forget states
-        with torch.no_grad():
-            old_policy = F.softmax(original_q_network(forget_states), dim=1)
-        new_policy = F.softmax(q_network(forget_states), dim=1)
-        
-        # KL divergence
-        divergence = F.kl_div(
-            new_policy.log(),
-            old_policy,
-            reduction='batchmean'
+    # Group samples by user
+    user_samples = {}
+    for sample in forget_dataset.samples:
+        user_id = sample['user_id']
+        if user_id in forget_users:
+            if user_id not in user_samples:
+                user_samples[user_id] = []
+            user_samples[user_id].append(sample)
+    
+    # Sample randomly from each user
+    for user_id, samples in user_samples.items():
+        # Sample with replacement if needed
+        n_samples = min(num_samples_per_user, len(samples))
+        sampled_indices = np.random.choice(
+            len(samples), 
+            size=n_samples, 
+            replace=(n_samples > len(samples))
         )
         
-        # Performance preservation on retain set
-        if retain_actions.dim() == 1:
-            retain_actions = retain_actions.unsqueeze(1)
-        if retain_rewards.dim() == 1:
-            retain_rewards = retain_rewards.unsqueeze(1)
-        
-        q_retain = q_network(retain_states).gather(1, retain_actions)
-        performance_loss = -torch.mean(q_retain * retain_rewards)
-        
-        # Combined loss
-        total_loss = self.lambda1 * divergence + self.lambda2 * performance_loss
-        
-        loss_dict = {
-            'total_loss': total_loss.item(),
-            'divergence_loss': divergence.item(),
-            'performance_loss': performance_loss.item()
-        }
-        
-        return total_loss, loss_dict
+        for idx in sampled_indices:
+            sample = samples[idx]
+            
+            # Concatenate user state + candidate
+            input_vec = torch.cat([
+                torch.FloatTensor(sample['user_state']),
+                torch.FloatTensor(sample['candidate_features'])
+            ])
+            
+            # Random action: 0 or 1
+            random_action = np.random.randint(0, 2)
+            
+            random_samples['inputs'].append(input_vec)
+            random_samples['actions'].append(random_action)
+            random_samples['user_ids'].append(user_id)
+            random_samples['movie_ids'].append(sample['movie_id'])
+    
+    # Convert to tensors
+    if len(random_samples['inputs']) > 0:
+        random_samples['inputs'] = torch.stack(random_samples['inputs']).to(device)
+        random_samples['actions'] = torch.LongTensor(random_samples['actions']).to(device)
+        random_samples['user_ids'] = torch.LongTensor(random_samples['user_ids']).to(device)
+        random_samples['movie_ids'] = torch.LongTensor(random_samples['movie_ids']).to(device)
+    
+    print(f"Created {len(random_samples['inputs'])} random samples from {len(user_samples)} forget users")
+    
+    return random_samples
 
 
-# Example usage
+# Test code
 if __name__ == "__main__":
-    print("Testing loss functions...")
+    print("Testing Loss Functions...")
+    
+    batch_size = 32
+    
+    # Test DQN Training Loss
+    print("\n" + "="*70)
+    print("Testing DQNRecommendationLoss")
+    print("="*70)
+    
+    loss_fn = DQNRecommendationLoss(rating_threshold=4.0)
     
     # Create dummy data
-    batch_size = 32
-    state_dim = 100
-    action_dim = 1000
+    q_values = torch.randn(batch_size, 2)
+    ratings = torch.rand(batch_size) * 4.5 + 0.5  # [0.5, 5.0]
+    labels = (ratings >= 4.0).long()
     
-    # Create networks
-    from dqn_model import DQN
-    q_network = DQN(state_dim, action_dim)
-    target_network = DQN(state_dim, action_dim)
-    target_network.copy_weights_from(q_network)
-    target_network.eval()
+    print(f"\nBatch size: {batch_size}")
+    print(f"Ratings: min={ratings.min():.2f}, max={ratings.max():.2f}")
+    print(f"Labels: {labels.sum().item()} positive, {(batch_size - labels.sum()).item()} negative")
     
-    # Test standard DQN loss
-    print("\n1. Testing Standard DQN Loss...")
-    dqn_loss_fn = DQNLoss(gamma=0.99)
+    # Compute Q-targets
+    q_targets = loss_fn.compute_q_targets(ratings, labels)
+    print(f"\nQ-targets shape: {q_targets.shape}")
+    print(f"Sample Q-target (positive, rating=5.0): {q_targets[labels==1][0] if (labels==1).any() else 'N/A'}")
+    print(f"Sample Q-target (negative, rating=2.0): {q_targets[labels==0][0] if (labels==0).any() else 'N/A'}")
     
-    states = torch.randn(batch_size, state_dim)
-    actions = torch.randint(0, action_dim, (batch_size,))
-    rewards = torch.rand(batch_size) * 5.0  # Ratings 0-5
-    next_states = torch.randn(batch_size, state_dim)
-    dones = torch.zeros(batch_size)
+    # Compute loss
+    loss, loss_dict = loss_fn(q_values, ratings, labels)
+    print(f"\nLoss: {loss.item():.4f}")
+    print("Loss components:")
+    for key, val in loss_dict.items():
+        print(f"  {key}: {val:.4f}")
     
-    loss = dqn_loss_fn(q_network, target_network, states, actions, rewards, next_states, dones)
-    print(f"DQN Loss: {loss.item():.4f}")
-    
-    # Test Double DQN loss
-    print("\n2. Testing Double DQN Loss...")
-    double_dqn_loss_fn = DoubleDQNLoss(gamma=0.99)
-    loss = double_dqn_loss_fn(q_network, target_network, states, actions, rewards, next_states, dones)
-    print(f"Double DQN Loss: {loss.item():.4f}")
-    
-    # Test Decremental RL loss
-    print("\n3. Testing Decremental RL Loss...")
-    original_q_network = DQN(state_dim, action_dim)
-    original_q_network.copy_weights_from(q_network)
-    original_q_network.eval()
+    # Test Decremental RL Loss
+    print("\n" + "="*70)
+    print("Testing DecrementalRLLoss")
+    print("="*70)
     
     unlearning_loss_fn = DecrementalRLLoss(lambda_weight=1.0)
     
-    forget_states = torch.randn(16, state_dim)
-    forget_actions = torch.randint(0, action_dim, (16,))
-    retain_states = torch.randn(16, state_dim)
-    retain_actions = torch.randint(0, action_dim, (16,))
+    # Forget set
+    batch_forget = 16
+    q_new_forget = torch.randn(batch_forget, 2)
+    forget_actions = torch.randint(0, 2, (batch_forget,))
     
-    loss, loss_dict = unlearning_loss_fn(
-        q_network, original_q_network,
-        forget_states, forget_actions,
-        retain_states, retain_actions
+    # Retain set
+    batch_retain = 32
+    q_new_retain = torch.randn(batch_retain, 2)
+    q_original_retain = torch.randn(batch_retain, 2)
+    
+    print(f"\nForget batch: {batch_forget}")
+    print(f"Retain batch: {batch_retain}")
+    print(f"Random actions: {forget_actions[:5]}")
+    
+    # Compute loss
+    unlearn_loss, unlearn_dict = unlearning_loss_fn(
+        q_new_forget, forget_actions,
+        q_new_retain, q_original_retain
     )
-    print(f"Unlearning Loss: {loss.item():.4f}")
-    print(f"Loss components: {loss_dict}")
     
-    print("\nAll tests passed!")
+    print(f"\nUnlearning loss: {unlearn_loss.item():.4f}")
+    print("Loss components:")
+    for key, val in unlearn_dict.items():
+        print(f"  {key}: {val:.4f}")
+    
+    # Test Simplified Loss
+    print("\n" + "="*70)
+    print("Testing DecrementalRLLossSimplified")
+    print("="*70)
+    
+    simplified_loss_fn = DecrementalRLLossSimplified(lambda_weight=1.0)
+    
+    simplified_loss, simplified_dict = simplified_loss_fn(
+        q_new_forget, q_new_retain, q_original_retain
+    )
+    
+    print(f"\nSimplified loss: {simplified_loss.item():.4f}")
+    print("Loss components:")
+    for key, val in simplified_dict.items():
+        print(f"  {key}: {val:.4f}")
+    
+    # Test backward pass
+    print("\n" + "="*70)
+    print("Testing Backward Pass")
+    print("="*70)
+    
+    # Training loss
+    q_values_grad = torch.randn(batch_size, 2, requires_grad=True)
+    loss, _ = loss_fn(q_values_grad, ratings, labels)
+    loss.backward()
+    print(f"Training loss backward: ✓ (grad norm: {q_values_grad.grad.norm().item():.4f})")
+    
+    # Unlearning loss
+    q_new_forget_grad = torch.randn(batch_forget, 2, requires_grad=True)
+    q_new_retain_grad = torch.randn(batch_retain, 2, requires_grad=True)
+    unlearn_loss, _ = unlearning_loss_fn(
+        q_new_forget_grad, forget_actions,
+        q_new_retain_grad, q_original_retain
+    )
+    unlearn_loss.backward()
+    print(f"Unlearning loss backward: ✓")
+    print(f"  Forget grad norm: {q_new_forget_grad.grad.norm().item():.4f}")
+    print(f"  Retain grad norm: {q_new_retain_grad.grad.norm().item():.4f}")
+    
+    print("\n✅ All loss function tests passed!")
