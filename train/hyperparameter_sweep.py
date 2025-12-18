@@ -413,7 +413,7 @@ class ObjectiveFunction:
             
             dqn_full = DQNWithTargetNetwork(
                 input_dim=self.actual_input_dim,
-                hidden_dims=[128, 128],
+                hidden_dims=[128, 256, 256, 128],
                 dropout_rate=0.2,
                 device=self.device,
                 target_update_freq=1000,
