@@ -348,7 +348,7 @@ class ObjectiveFunction:
         """
         
         # Sample hyperparameters
-        lambda_weight = trial.suggest_float('lambda_weight', 0.01, 100.0, log=True)
+        lambda_weight = trial.suggest_float('lambda_weight', 0.01, 10.0, log=True)
         unlearn_lr = trial.suggest_float('unlearn_lr', 1e-5, 1e-3, log=True)
         train_lr = trial.suggest_float('train_lr', 1e-5, 5e-3, log=True)
         train_epochs = trial.suggest_int('train_epochs', 5, 20, step=2)
@@ -368,7 +368,7 @@ class ObjectiveFunction:
             
             dqn_baseline = DQNWithTargetNetwork(
                 input_dim=self.actual_input_dim,
-                hidden_dims=[128, 128],
+                hidden_dims=[128, 256, 256, 128],
                 dropout_rate=0.2,
                 device=self.device,
                 target_update_freq=1000,

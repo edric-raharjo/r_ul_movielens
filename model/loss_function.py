@@ -19,7 +19,7 @@ class DQNRecommendationLoss(nn.Module):
         self,
         rating_threshold: float = 4.0,
         max_rating: float = 5.0,
-        negative_boost: float = 1.0
+        negative_boost: float = 2.0
     ):
         """
         Args:
