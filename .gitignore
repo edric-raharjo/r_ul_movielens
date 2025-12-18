@@ -4,3 +4,4 @@ env/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints
 results/*
+checkpoints/*
