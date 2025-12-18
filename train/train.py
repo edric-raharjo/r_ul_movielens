@@ -404,7 +404,7 @@ def main(args):
         print("INITIALIZING MODEL")
         print("="*80)
         
-        # Note: Input dim is 44 (22 user + 22 candidate) as per our design
+
         dqn_manager = DQNWithTargetNetwork(
             input_dim=42,  # Fixed based on our architecture
             hidden_dims=[128, 128],  # From paper
@@ -426,7 +426,7 @@ def main(args):
         if args.pretrained_path is None:
             args.pretrained_path = str(checkpoint_dir / 'dqn_trained.pt')
         
-        trained_model = RecommendationDQN(input_dim=44, hidden_dims=[128, 128])
+        trained_model = RecommendationDQN(input_dim=42, hidden_dims=[128, 128])
         trained_model.load_state_dict(torch.load(args.pretrained_path, map_location=args.device))
         trained_model.to(args.device)
         print(f"Model loaded from {args.pretrained_path}")
@@ -573,7 +573,7 @@ if __name__ == "__main__":
     # Unlearning arguments
     parser.add_argument('--unlearning_epochs', type=int, default=10,
                        help='Number of unlearning epochs')
-    parser.add_argument('--unlearning_lr', type=float, default=1e-5,
+    parser.add_argument('--unlearning_lr', type=float, default=2e-4,
                        help='Learning rate for unlearning')
     parser.add_argument('--lambda_weight', type=float, default=1.0,
                        help='Lambda weight for retain set regularization')

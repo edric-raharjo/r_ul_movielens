@@ -1,4 +1,4 @@
-# dataset/dataloader.py
+# dataset/dataloader.py - OPTIMIZED VERSION
 
 import pandas as pd
 import numpy as np
@@ -8,15 +8,13 @@ from pathlib import Path
 from typing import Tuple, Optional, Dict, List
 import pickle
 import re
+from tqdm import tqdm
 
 
 class MovieLensRecommendationDataset(Dataset):
     """
-    MovieLens dataset for binary recommendation with DQN.
-    
-    Each sample: Should we recommend this movie to this user?
-    - Input: User state (22-dim) + Candidate movie (22-dim) = 44-dim
-    - Output: Binary label (0=no, 1=yes) + Reward (actual rating)
+    MovieLens dataset for binary movie recommendation with DQN.
+    OPTIMIZED for large datasets.
     """
     
     def __init__(
@@ -25,24 +23,12 @@ class MovieLensRecommendationDataset(Dataset):
         forget_ratio: float = 0.1,
         rating_threshold: float = 4.0,
         min_ratings: int = 20,
-        train_ratio: float = 0.8,  # Temporal split
+        train_ratio: float = 0.8,
         user_total: Optional[int] = None,
-        mode: str = 'train',  # 'train', 'retain', 'forget'
-        split: str = 'train',  # 'train' or 'test'
+        mode: str = 'train',
+        split: str = 'train',
         seed: int = 42
     ):
-        """
-        Args:
-            data_dir: Path to MovieLens data directory
-            forget_ratio: Ratio of users to put in forget set
-            rating_threshold: Ratings >= this are positive (recommend)
-            min_ratings: Minimum ratings per user to include
-            train_ratio: Ratio for temporal train/test split per user
-            user_total: Total users to use (None = all)
-            mode: 'train' (all users), 'retain' (retain only), 'forget' (forget only)
-            split: 'train' or 'test' (temporal split within each user)
-            seed: Random seed
-        """
         self.data_dir = Path(data_dir)
         self.forget_ratio = forget_ratio
         self.rating_threshold = rating_threshold
@@ -57,17 +43,20 @@ class MovieLensRecommendationDataset(Dataset):
         
         print(f"\n{'='*70}")
         print(f"Loading MovieLens Dataset")
-        print(f"Mode: {mode} | Split: {split}")
+        print(f"Mode: {mode} | Split: {split} | Pilot users: {user_total}")
         print(f"{'='*70}")
         
-        # Load data
-        self._load_data()
+        # Load and filter data FIRST
+        self._load_and_filter_data()
         
-        # Extract genres
+        # Extract genres and movie features
         self._extract_genres()
         
         # Split users
         self._split_users()
+        
+        # Precompute user states (OPTIMIZATION)
+        self._precompute_user_states()
         
         # Prepare samples
         self._prepare_samples()
@@ -75,18 +64,41 @@ class MovieLensRecommendationDataset(Dataset):
         print(f"Dataset ready: {len(self.samples)} samples from {len(self.current_users)} users")
         print(f"{'='*70}\n")
     
-    def _load_data(self):
-        """Load ratings and movies"""
+    def _load_and_filter_data(self):
+        """Load and immediately filter data to relevant users only"""
         print("Loading ratings.csv...")
-        self.ratings_df = pd.read_csv(self.data_dir / 'rating.csv')
-        self.ratings_df['timestamp'] = pd.to_datetime(self.ratings_df['timestamp'])
+        ratings_df = pd.read_csv(self.data_dir / 'rating.csv')
+        ratings_df['timestamp'] = pd.to_datetime(ratings_df['timestamp'])
         
-        print("Loading movies.csv...")
+        print(f"  Total ratings: {len(ratings_df):,}")
+        print(f"  Total users: {ratings_df['userId'].nunique():,}")
+        
+        # Filter users with minimum ratings FIRST
+        print(f"\nFiltering users with >= {self.min_ratings} ratings...")
+        user_counts = ratings_df['userId'].value_counts()
+        valid_users = user_counts[user_counts >= self.min_ratings].index.tolist()
+        print(f"  Valid users: {len(valid_users):,}")
+        
+        # Sample users if pilot mode
+        if self.user_total is not None:
+            np.random.shuffle(valid_users)
+            valid_users = valid_users[:self.user_total]
+            print(f"  [PILOT MODE] Sampled {len(valid_users)} users")
+        
+        # Filter ratings to only include selected users
+        print(f"Filtering ratings to selected users...")
+        self.ratings_df = ratings_df[ratings_df['userId'].isin(valid_users)].copy()
+        del ratings_df  # Free memory
+        
+        print(f"  Filtered ratings: {len(self.ratings_df):,}")
+        
+        # Store valid users for later
+        self.valid_users = valid_users
+        
+        # Load movies
+        print("\nLoading movies.csv...")
         self.movies_df = pd.read_csv(self.data_dir / 'movie.csv')
-        
-        print(f"  Ratings: {len(self.ratings_df):,}")
         print(f"  Movies: {len(self.movies_df):,}")
-        print(f"  Users: {self.ratings_df['userId'].nunique():,}")
     
     def _extract_genres(self):
         """Extract and encode genres"""
@@ -102,21 +114,22 @@ class MovieLensRecommendationDataset(Dataset):
         self.genre_to_idx = {g: i for i, g in enumerate(self.genre_list)}
         self.num_genres = len(self.genre_list)
         
-        print(f"  Found {self.num_genres} unique genres: {self.genre_list[:5]}...")
+        print(f"  Found {self.num_genres} unique genres")
         
         # Encode genres for each movie
+        print("Encoding movie genres...")
         self.movies_df['genre_vector'] = self.movies_df['genres'].apply(
             self._encode_genre
         )
         
-        # Extract release year from title
-        print("\nExtracting release years...")
+        # Extract release year
+        print("Extracting release years...")
         self.movies_df['release_year'] = self.movies_df['title'].apply(
             self._extract_year
         )
         
-        # Compute average rating per movie
-        print("Computing average ratings per movie...")
+        # Compute average rating per movie (only for filtered data)
+        print("Computing average ratings...")
         movie_avg_ratings = self.ratings_df.groupby('movieId')['rating'].mean()
         self.movies_df = self.movies_df.merge(
             movie_avg_ratings.rename('avg_rating'),
@@ -124,28 +137,29 @@ class MovieLensRecommendationDataset(Dataset):
             right_index=True,
             how='left'
         )
-        self.movies_df['avg_rating'].fillna(self.movies_df['avg_rating'].mean(), inplace=True)
+        # Fill NaN with global mean
+        global_mean = self.ratings_df['rating'].mean()
+        self.movies_df['avg_rating'].fillna(global_mean, inplace=True)
         
-        # Create movie features lookup
+        # Create movie features lookup (only for movies in filtered data)
+        print("Creating movie features lookup...")
+        relevant_movies = self.ratings_df['movieId'].unique()
+        self.movies_df_filtered = self.movies_df[
+            self.movies_df['movieId'].isin(relevant_movies)
+        ].copy()
+        
         self.movie_features = {}
-        for _, row in self.movies_df.iterrows():
+        for _, row in self.movies_df_filtered.iterrows():
             self.movie_features[row['movieId']] = {
                 'year': row['release_year'],
                 'genre_vector': row['genre_vector'],
                 'avg_rating': row['avg_rating']
             }
+        
+        print(f"  Movie features cached: {len(self.movie_features)} movies")
     
     def _encode_genre(self, genre_string: str) -> np.ndarray:
-        """
-        Encode genre string to probability distribution.
-        
-        Args:
-            genre_string: e.g., "Action|Romance"
-            
-        Returns:
-            Probability distribution over genres (num_genres,)
-            e.g., [0.5, 0.0, ..., 0.5, ...] if Action and Romance
-        """
+        """Encode genre string to probability distribution"""
         if not isinstance(genre_string, str) or genre_string == '(no genres listed)':
             return np.zeros(self.num_genres)
         
@@ -163,49 +177,34 @@ class MovieLensRecommendationDataset(Dataset):
         return multi_hot
     
     def _extract_year(self, title: str) -> float:
-        """
-        Extract release year from movie title.
-        
-        Args:
-            title: e.g., "Toy Story (1995)"
-            
-        Returns:
-            Normalized year (year - 1900) / 100
-        """
+        """Extract release year from movie title"""
         match = re.search(r'\((\d{4})\)', title)
         if match:
             year = int(match.group(1))
             return (year - 1900) / 100.0
         else:
-            # Use median year if not found
-            return (1995 - 1900) / 100.0  # Default to 1995
+            return (1995 - 1900) / 100.0  # Default
     
     def _split_users(self):
         """Split users into retain and forget sets"""
-        print("\nSplitting users...")
+        print("\nSplitting users into retain/forget sets...")
         
-        # Filter users with minimum ratings
-        user_counts = self.ratings_df['userId'].value_counts()
-        valid_users = user_counts[user_counts >= self.min_ratings].index.tolist()
+        # Use pre-filtered valid users
+        valid_users = self.valid_users
         
-        # Limit total users if specified
-        if self.user_total is not None:
-            np.random.shuffle(valid_users)
-            valid_users = valid_users[:self.user_total]
-            print(f"  Pilot mode: Limited to {len(valid_users)} users")
-        
-        # Randomly split users
+        # Randomly split
         np.random.shuffle(valid_users)
         forget_size = int(len(valid_users) * self.forget_ratio)
         
         self.forget_users = set(valid_users[:forget_size])
         self.retain_users = set(valid_users[forget_size:])
         
-        print(f"  Users split: {len(self.retain_users)} retain, {len(self.forget_users)} forget")
+        print(f"  Retain users: {len(self.retain_users)}")
+        print(f"  Forget users: {len(self.forget_users)}")
         
         # Select users based on mode
         if self.mode == 'train':
-            self.current_users = valid_users  # All users
+            self.current_users = valid_users
         elif self.mode == 'retain':
             self.current_users = list(self.retain_users)
         elif self.mode == 'forget':
@@ -215,19 +214,17 @@ class MovieLensRecommendationDataset(Dataset):
         
         print(f"  Current mode '{self.mode}': {len(self.current_users)} users")
     
-    def _prepare_samples(self):
+    def _precompute_user_states(self):
         """
-        Prepare training/test samples.
-        
-        Each sample: (user_state, candidate_movie, label, reward)
+        OPTIMIZATION: Precompute user states for all users.
+        This avoids recomputing the same user state for every sample.
         """
-        print(f"\nPreparing {self.split} samples...")
+        print(f"\nPrecomputing user states for {len(self.current_users)} users...")
         
-        self.samples = []
-        users_with_samples = 0
+        self.user_states = {}
         
-        for user_id in self.current_users:
-            # Get user's ratings sorted by timestamp (temporal)
+        for user_id in tqdm(self.current_users, desc="Computing user states"):
+            # Get user's training data (for state computation)
             user_ratings = self.ratings_df[
                 self.ratings_df['userId'] == user_id
             ].sort_values('timestamp')
@@ -235,34 +232,63 @@ class MovieLensRecommendationDataset(Dataset):
             if len(user_ratings) < self.min_ratings:
                 continue
             
+            # Use only training portion for state
+            split_idx = int(len(user_ratings) * self.train_ratio)
+            user_train_data = user_ratings.iloc[:split_idx]
+            
+            if len(user_train_data) == 0:
+                continue
+            
+            # Compute state
+            user_state = self._compute_user_state(user_train_data, user_id)
+            self.user_states[user_id] = user_state
+        
+        print(f"  Cached {len(self.user_states)} user states")
+    
+    def _prepare_samples(self):
+        """
+        Prepare training/test samples.
+        OPTIMIZED: Uses pre-cached user states and vectorized operations.
+        """
+        print(f"\nPreparing {self.split} samples...")
+        
+        self.samples = []
+        
+        for user_id in tqdm(self.current_users, desc="Creating samples"):
+            if user_id not in self.user_states:
+                continue
+            
+            # Get user's ratings
+            user_ratings = self.ratings_df[
+                self.ratings_df['userId'] == user_id
+            ].sort_values('timestamp')
+            
             # Temporal split
             split_idx = int(len(user_ratings) * self.train_ratio)
             
             if self.split == 'train':
                 user_data = user_ratings.iloc[:split_idx]
-            else:  # test
+            else:
                 user_data = user_ratings.iloc[split_idx:]
             
             if len(user_data) == 0:
                 continue
             
-            # Compute user state from training data only (to avoid data leakage)
-            user_train_data = user_ratings.iloc[:split_idx]
-            user_state = self._compute_user_state(user_train_data, user_id)
+            # Get pre-computed user state
+            user_state = self.user_states[user_id]
             
-            # Create samples for each rating in current split
+            # Create samples (vectorized where possible)
             for _, row in user_data.iterrows():
                 movie_id = row['movieId']
                 rating = row['rating']
                 
-                # Skip if movie features not available
                 if movie_id not in self.movie_features:
                     continue
                 
-                # Get candidate movie features
+                # Get candidate features
                 candidate_features = self._get_candidate_features(movie_id)
                 
-                # Label: 1 if recommend, 0 if not
+                # Label
                 label = 1 if rating >= self.rating_threshold else 0
                 
                 self.samples.append({
@@ -273,54 +299,42 @@ class MovieLensRecommendationDataset(Dataset):
                     'label': label,
                     'reward': rating
                 })
-            
-            users_with_samples += 1
-        
-        print(f"  Created {len(self.samples):,} samples from {users_with_samples} users")
         
         # Class distribution
         num_positive = sum(1 for s in self.samples if s['label'] == 1)
         num_negative = len(self.samples) - num_positive
-        print(f"  Positive samples (rating >= {self.rating_threshold}): {num_positive:,} ({num_positive/len(self.samples)*100:.1f}%)")
-        print(f"  Negative samples (rating < {self.rating_threshold}): {num_negative:,} ({num_negative/len(self.samples)*100:.1f}%)")
+        print(f"\n  Total samples: {len(self.samples):,}")
+        print(f"  Positive (≥{self.rating_threshold}): {num_positive:,} ({num_positive/len(self.samples)*100:.1f}%)")
+        print(f"  Negative (<{self.rating_threshold}): {num_negative:,} ({num_negative/len(self.samples)*100:.1f}%)")
     
     def _compute_user_state(self, user_ratings: pd.DataFrame, user_id: int) -> np.ndarray:
-        """
-        Compute user state from their rating history.
-        
-        Returns:
-            User state vector (22-dim):
-            [avg_year(1), avg_rating(1), genre_distribution(20)]
-        """
+        """Compute user state from rating history"""
         if len(user_ratings) == 0:
-            # Return default state
-            return np.zeros(22)
+            return np.zeros(2 + self.num_genres)
         
-        # 1. Average release year
+        # Average release year
         years = []
         for movie_id in user_ratings['movieId']:
             if movie_id in self.movie_features:
                 years.append(self.movie_features[movie_id]['year'])
         avg_year = np.mean(years) if years else 0.5
         
-        # 2. Average rating given by user
+        # Average rating given
         avg_rating = user_ratings['rating'].mean() / 5.0
         
-        # 3. Genre distribution
+        # Genre distribution
         genre_vectors = []
         for movie_id in user_ratings['movieId']:
             if movie_id in self.movie_features:
                 genre_vectors.append(self.movie_features[movie_id]['genre_vector'])
         
         if genre_vectors:
-            # Sum all genre vectors
             genre_sum = np.sum(genre_vectors, axis=0)
-            # Normalize to probability distribution
             genre_dist = genre_sum / genre_sum.sum() if genre_sum.sum() > 0 else genre_sum
         else:
             genre_dist = np.zeros(self.num_genres)
         
-        # Concatenate: [avg_year(1), avg_rating(1), genre_dist(20)]
+        # Concatenate
         user_state = np.concatenate([
             [avg_year],
             [avg_rating],
@@ -330,19 +344,11 @@ class MovieLensRecommendationDataset(Dataset):
         return user_state.astype(np.float32)
     
     def _get_candidate_features(self, movie_id: int) -> np.ndarray:
-        """
-        Get candidate movie features.
-        
-        Returns:
-            Candidate features (22-dim):
-            [year(1), avg_rating(1), genre_distribution(20)]
-        """
+        """Get candidate movie features"""
         features = self.movie_features[movie_id]
         
-        # Normalize avg_rating
         avg_rating_norm = features['avg_rating'] / 5.0
         
-        # Concatenate: [year(1), avg_rating(1), genre_dist(20)]
         candidate_features = np.concatenate([
             [features['year']],
             [avg_rating_norm],
@@ -355,22 +361,11 @@ class MovieLensRecommendationDataset(Dataset):
         return len(self.samples)
     
     def __getitem__(self, idx):
-        """
-        Returns:
-            Dictionary with training sample
-        """
+        """Returns training sample"""
         sample = self.samples[idx]
         
         user_state = torch.FloatTensor(sample['user_state'])
         candidate = torch.FloatTensor(sample['candidate_features'])
-        
-        # DEBUG: Print dimensions on first call
-        if not hasattr(self, '_debug_printed'):
-            print(f"\n[DEBUG] Dimensions:")
-            print(f"  User state: {user_state.shape}")
-            print(f"  Candidate: {candidate.shape}")
-            print(f"  Num genres: {self.num_genres}")
-            self._debug_printed = True
         
         # Concatenate for network input
         input_features = torch.cat([user_state, candidate])
@@ -386,12 +381,7 @@ class MovieLensRecommendationDataset(Dataset):
         }
     
     def get_all_movie_features(self) -> Dict[int, np.ndarray]:
-        """
-        Get features for all movies (for evaluation).
-        
-        Returns:
-            Dict mapping movieId -> features (22-dim)
-        """
+        """Get features for all movies"""
         return {
             movie_id: self._get_candidate_features(movie_id)
             for movie_id in self.movie_features.keys()
@@ -418,13 +408,9 @@ def create_dataloaders(
     user_total: Optional[int] = None,
     **kwargs
 ) -> Tuple[Dict[str, DataLoader], MovieLensRecommendationDataset]:
-    """
-    Create train/test dataloaders for retain and forget sets.
+    """Create train/test dataloaders"""
     
-    Returns:
-        (dataloaders_dict, train_dataset)
-    """
-    # Training dataset (all users, train split)
+    # Training dataset
     train_dataset = MovieLensRecommendationDataset(
         data_dir=data_dir,
         forget_ratio=forget_ratio,
@@ -435,7 +421,7 @@ def create_dataloaders(
         **kwargs
     )
     
-    # Test datasets
+    # Test datasets (reuse split)
     retain_test_dataset = MovieLensRecommendationDataset(
         data_dir=data_dir,
         forget_ratio=forget_ratio,
@@ -464,38 +450,3 @@ def create_dataloaders(
     }
     
     return dataloaders, train_dataset
-
-
-# Test code
-if __name__ == "__main__":
-    data_dir = "E:\\Kuliah\\Kuliah\\Kuliah\\PRODI\\Semester 7\\ProSkripCode\\data_movie"
-    
-    print("Testing MovieLens Recommendation Dataset...")
-    
-    # Create dataloaders
-    dataloaders, train_dataset = create_dataloaders(
-        data_dir=data_dir,
-        forget_ratio=0.1,
-        rating_threshold=4.0,
-        batch_size=32,
-        user_total=50  # Pilot mode
-    )
-    
-    print(f"\n{'='*70}")
-    print("Dataset Statistics")
-    print(f"{'='*70}")
-    print(f"Input dimensions: {train_dataset.samples[0]['user_state'].shape[0] + train_dataset.samples[0]['candidate_features'].shape[0]}")
-    print(f"Number of genres: {train_dataset.num_genres}")
-    print(f"Genres: {train_dataset.genre_list}")
-    
-    # Test a batch
-    print(f"\n{'='*70}")
-    print("Testing Batch")
-    print(f"{'='*70}")
-    batch = next(iter(dataloaders['train']))
-    print(f"Batch keys: {batch.keys()}")
-    print(f"Input features shape: {batch['input_features'].shape}")
-    print(f"Labels shape: {batch['label'].shape}")
-    print(f"Labels distribution: {batch['label'].float().mean().item():.2%} positive")
-    
-    print("\n✅ Dataloader test passed!")
