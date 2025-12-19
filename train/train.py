@@ -559,9 +559,9 @@ if __name__ == "__main__":
                        help='Discount factor (not used in current implementation)')
     
     # Training arguments
-    parser.add_argument('--num_epochs', type=int, default=20,
+    parser.add_argument('--num_epochs', type=int, default=10,
                        help='Number of training epochs')
-    parser.add_argument('--batch_size', type=int, default=64,
+    parser.add_argument('--batch_size', type=int, default=32,
                        help='Batch size')
     parser.add_argument('--learning_rate', type=float, default=1e-4,
                        help='Learning rate for normal training')
@@ -571,7 +571,7 @@ if __name__ == "__main__":
                        help='Evaluation frequency (epochs)')
     
     # Unlearning arguments
-    parser.add_argument('--unlearning_epochs', type=int, default=10,
+    parser.add_argument('--unlearning_epochs', type=int, default=5,
                        help='Number of unlearning epochs')
     parser.add_argument('--unlearning_lr', type=float, default=2e-4,
                        help='Learning rate for unlearning')

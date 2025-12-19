@@ -348,11 +348,11 @@ class ObjectiveFunction:
         """
         
         # Sample hyperparameters
-        lambda_weight = trial.suggest_float('lambda_weight', 0.01, 10.0, log=True)
-        unlearn_lr = trial.suggest_float('unlearn_lr', 1e-5, 1e-3, log=True)
+        lambda_weight = trial.suggest_float('lambda_weight', 0.1, 10.0, log=True)
+        unlearn_lr = trial.suggest_float('unlearn_lr', 1e-5, 2e-3, log=True)
         train_lr = trial.suggest_float('train_lr', 1e-5, 5e-3, log=True)
-        train_epochs = trial.suggest_int('train_epochs', 5, 20, step=2)
-        unlearn_epochs = trial.suggest_int('unlearn_epochs', 5, 20, step=2)
+        train_epochs = trial.suggest_int('train_epochs', 5, 30, step=2)
+        unlearn_epochs = trial.suggest_int('unlearn_epochs', 5, 30, step=2)
         
         print(f"\n{'='*80}")
         print(f"Trial {trial.number}")
@@ -361,6 +361,7 @@ class ObjectiveFunction:
         print(f"{'='*80}")
         
         try:
+            hidden_dims = [128, 128]
             # ==================================================================
             # MODEL 1: BASELINE (Train on RETAIN only)
             # ==================================================================
@@ -368,7 +369,7 @@ class ObjectiveFunction:
             
             dqn_baseline = DQNWithTargetNetwork(
                 input_dim=self.actual_input_dim,
-                hidden_dims=[128, 256, 256, 128],
+                hidden_dims=hidden_dims,
                 dropout_rate=0.2,
                 device=self.device,
                 target_update_freq=1000,
@@ -413,7 +414,7 @@ class ObjectiveFunction:
             
             dqn_full = DQNWithTargetNetwork(
                 input_dim=self.actual_input_dim,
-                hidden_dims=[128, 256, 256, 128],
+                hidden_dims=hidden_dims,
                 dropout_rate=0.2,
                 device=self.device,
                 target_update_freq=1000,
@@ -492,8 +493,11 @@ class ObjectiveFunction:
             test_drop = model2_test['accuracy'] - model3_test['accuracy']
             
             # Quality metric
-            quality = forget_drop - 2 * test_drop
-            
+            if forget_drop < 0.03:
+                quality = -1.0  # Fail trial
+            else:
+                quality = forget_drop - test_drop
+                        
             print(f"\n{'='*80}")
             print(f"Trial {trial.number} Results:")
             print(f"  Model 1 (Baseline)  - Forget: {model1_forget['accuracy']:.2%}, Test: {model1_test['accuracy']:.2%}")
